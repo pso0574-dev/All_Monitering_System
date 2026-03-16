@@ -1,23 +1,24 @@
 # streamlit_app.py
 # ============================================================
 # Personal Financial View Dashboard
-# - Tab 1: FX & Macro Market Monitoring
+# - Tab 1: FX & Macro Market
 # - Tab 2: FRED Macro Analysis
 # - Tab 3: FRED Detail Charts
 #
-# FX & Macro Market Monitoring:
+# FX & Macro Market:
 # - Summary table first
-# - Charts shown below
-# - USD/KRW, EUR/KRW, EUR/USD, DXY
+# - Charts below
+# - USD/KRW, EUR/KRW, EUR/USD, DXY (fallback)
 # - BTC/EUR, WTI, Brent, Gold, Silver, Natural Gas
 #
-# Features:
-# - Flexible period / interval selection
-# - Real-time refresh support
-# - Moving averages
-# - 52-week range position
-# - Z-score
-# - Compact summary table
+# FRED Macro Analysis:
+# - Overview
+# - Liquidity
+# - Rates
+# - Credit
+# - Inflation
+# - Labor
+# - Recession
 #
 # Run:
 #   streamlit run streamlit_app.py
@@ -35,7 +36,7 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -55,7 +56,7 @@ st.set_page_config(
 )
 
 st.title("📊 Personal Financial View Dashboard")
-st.caption("FX monitoring + macro market assets + FRED macro analysis dashboard")
+st.caption("FX monitoring + macro market assets + FRED macro risk dashboard")
 
 
 # ============================================================
@@ -86,19 +87,19 @@ MARKET_TICKERS = {
         "ticker": "EURKRW=X",
         "label": "EUR / KRW",
         "y_title": "KRW per EUR",
-        "interpretation": "Higher EUR/KRW can increase Germany-based living and spending burden in KRW terms.",
+        "interpretation": "Higher EUR/KRW can raise Germany-based living cost burden in KRW terms.",
     },
     "EURUSD": {
         "ticker": "EURUSD=X",
         "label": "EUR / USD",
         "y_title": "USD per EUR",
-        "interpretation": "EUR/USD helps track broad EUR versus USD strength.",
+        "interpretation": "EUR/USD tracks broad EUR versus USD strength.",
     },
     "DXY": {
-        "ticker": "DX-Y.NYB",
-        "label": "US Dollar Index (DXY)",
-        "y_title": "Index",
-        "interpretation": "A stronger DXY often tightens global financial conditions.",
+        "ticker": ["DX-Y.NYB", "DX=F", "UUP"],
+        "label": "US Dollar Index / Proxy",
+        "y_title": "Index / Proxy",
+        "interpretation": "A stronger dollar proxy often tightens global financial conditions.",
     },
     "BTCEUR": {
         "ticker": "BTC-EUR",
@@ -128,7 +129,7 @@ MARKET_TICKERS = {
         "ticker": "SI=F",
         "label": "Silver",
         "y_title": "USD",
-        "interpretation": "Silver has both inflation/precious-metal and industrial demand characteristics.",
+        "interpretation": "Silver mixes precious-metal behavior with industrial demand.",
     },
     "NATGAS": {
         "ticker": "NG=F",
@@ -139,46 +140,93 @@ MARKET_TICKERS = {
 }
 
 FRED_SERIES = {
-    "DGS10": {
-        "name": "US 10Y Treasury Yield",
-        "category": "Rates",
-        "description": "Higher long-term yields can pressure equity valuations and tighten financial conditions.",
+    "WALCL": {
+        "name": "Fed Total Assets",
+        "category": "Liquidity",
+        "description": "Fed balance sheet size. Rising assets often imply more liquidity support.",
     },
-    "FEDFUNDS": {
-        "name": "Fed Funds Rate",
-        "category": "Rates",
-        "description": "Higher policy rates generally increase financing costs and reduce liquidity.",
+    "RRPONTSYD": {
+        "name": "Overnight Reverse Repo",
+        "category": "Liquidity",
+        "description": "High reverse repo usage can reflect excess money-market liquidity parking.",
     },
-    "T10Y2Y": {
-        "name": "10Y - 2Y Treasury Spread",
-        "category": "Yield Curve",
-        "description": "Deep inversion often signals recession risk.",
+    "WTREGEN": {
+        "name": "Treasury General Account",
+        "category": "Liquidity",
+        "description": "TGA changes can drain or inject market liquidity depending on direction.",
     },
     "M2SL": {
         "name": "M2 Money Supply",
         "category": "Liquidity",
-        "description": "A stronger money/liquidity backdrop can be supportive for risk assets.",
+        "description": "Money supply trend is a broad liquidity backdrop for risk assets.",
     },
-    "CPIAUCSL": {
-        "name": "CPI (All Urban Consumers)",
-        "category": "Inflation",
-        "description": "Higher inflation can pressure bonds and force tighter policy.",
+    "FEDFUNDS": {
+        "name": "Fed Funds Rate",
+        "category": "Rates",
+        "description": "Higher policy rates reduce liquidity and increase financing costs.",
     },
-    "UNRATE": {
-        "name": "US Unemployment Rate",
-        "category": "Labor",
-        "description": "Rising unemployment can reflect economic slowdown or recession stress.",
+    "DGS2": {
+        "name": "US 2Y Treasury Yield",
+        "category": "Rates",
+        "description": "Short-end rates reflect policy expectations and tightening pressure.",
+    },
+    "DGS10": {
+        "name": "US 10Y Treasury Yield",
+        "category": "Rates",
+        "description": "Long-end yields matter for valuation multiples and discount rates.",
+    },
+    "T10Y2Y": {
+        "name": "10Y - 2Y Treasury Spread",
+        "category": "Recession",
+        "description": "Yield curve inversion is a classic recession warning signal.",
     },
     "BAMLH0A0HYM2": {
         "name": "High Yield OAS",
         "category": "Credit",
-        "description": "Wider credit spreads indicate rising financial stress and risk aversion.",
+        "description": "Wider high-yield spreads suggest financial stress and risk aversion.",
+    },
+    "BAMLC0A0CM": {
+        "name": "US Corporate Master OAS",
+        "category": "Credit",
+        "description": "Corporate credit spread gauge for broad financing conditions.",
+    },
+    "CPIAUCSL": {
+        "name": "CPI (All Urban Consumers)",
+        "category": "Inflation",
+        "description": "Inflation pressure affects rates, real returns, and policy stance.",
+    },
+    "PCEPI": {
+        "name": "PCE Price Index",
+        "category": "Inflation",
+        "description": "PCE is a key Fed inflation gauge.",
+    },
+    "UNRATE": {
+        "name": "US Unemployment Rate",
+        "category": "Labor",
+        "description": "Rising unemployment can indicate weakening macro conditions.",
+    },
+    "PAYEMS": {
+        "name": "Nonfarm Payrolls",
+        "category": "Labor",
+        "description": "Payroll growth helps track labor momentum and economic resilience.",
+    },
+    "ICSA": {
+        "name": "Initial Jobless Claims",
+        "category": "Labor",
+        "description": "Jobless claims are a timely labor stress indicator.",
+    },
+    "USREC": {
+        "name": "US Recession Indicator",
+        "category": "Recession",
+        "description": "NBER recession indicator series.",
     },
 }
 
+CATEGORY_ORDER = ["Liquidity", "Rates", "Credit", "Inflation", "Labor", "Recession"]
+
 
 # ============================================================
-# Helper functions
+# Helpers
 # ============================================================
 def safe_pct_change(series: pd.Series, periods: int = 1) -> Optional[float]:
     s = pd.to_numeric(series, errors="coerce").dropna()
@@ -211,9 +259,9 @@ def format_pct(x: Optional[float], ndigits: int = 2) -> str:
 
 
 def score_to_label(score: int) -> Tuple[str, str]:
-    if score <= 2:
-        return "Low Risk", "🟢"
     if score <= 4:
+        return "Low Risk", "🟢"
+    if score <= 9:
         return "Moderate Risk", "🟡"
     return "High Risk", "🔴"
 
@@ -237,7 +285,6 @@ def normalize_time_column(df: pd.DataFrame) -> pd.DataFrame:
         if col in out.columns:
             found = col
             break
-
     if found is None:
         found = out.columns[0]
 
@@ -260,7 +307,6 @@ def calc_zscore(series: pd.Series, window: int = 60) -> Optional[float]:
     recent = s.iloc[-window:]
     mean_val = recent.mean()
     std_val = recent.std()
-
     if std_val == 0 or pd.isna(std_val):
         return None
 
@@ -293,7 +339,6 @@ def calc_drawdown_from_high(series: pd.Series, window: int = 252) -> Optional[fl
     recent = s.iloc[-window:]
     high_val = recent.max()
     last_val = recent.iloc[-1]
-
     if high_val == 0:
         return None
 
@@ -314,16 +359,65 @@ def get_period_days(period: str) -> int:
     return mapping.get(period, 365)
 
 
+def determine_series_freq(series_id: str) -> str:
+    weekly = {"WALCL", "RRPONTSYD", "ICSA"}
+    monthly = {"M2SL", "UNRATE", "PAYEMS", "CPIAUCSL", "PCEPI", "USREC"}
+    daily = {"FEDFUNDS", "DGS2", "DGS10", "T10Y2Y", "BAMLH0A0HYM2", "BAMLC0A0CM", "WTREGEN"}
+    if series_id in weekly:
+        return "weekly"
+    if series_id in monthly:
+        return "monthly"
+    if series_id in daily:
+        return "daily"
+    return "unknown"
+
+
+def compute_yoy_change(series: pd.Series, series_id: str) -> Optional[float]:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 2:
+        return None
+    freq = determine_series_freq(series_id)
+    if freq == "monthly":
+        periods = min(12, len(s) - 1)
+    elif freq == "weekly":
+        periods = min(52, len(s) - 1)
+    else:
+        periods = min(252, len(s) - 1)
+    return safe_pct_change(s, periods=periods)
+
+
+def compute_short_change(series: pd.Series, series_id: str) -> Optional[float]:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) < 2:
+        return None
+    freq = determine_series_freq(series_id)
+    if freq == "monthly":
+        periods = min(1, len(s) - 1)
+    elif freq == "weekly":
+        periods = min(4, len(s) - 1)
+    else:
+        periods = min(21, len(s) - 1)
+    return safe_pct_change(s, periods=periods)
+
+
 # ============================================================
 # Data loading
 # ============================================================
 @st.cache_data(ttl=300, show_spinner=False)
 def download_market_data(period: str = "2y", interval: str = "1d") -> Dict[str, pd.DataFrame]:
-    tickers = [v["ticker"] for v in MARKET_TICKERS.values()]
+    all_download_tickers = []
+    for meta in MARKET_TICKERS.values():
+        tk = meta["ticker"]
+        if isinstance(tk, list):
+            all_download_tickers.extend(tk)
+        else:
+            all_download_tickers.append(tk)
+
+    all_download_tickers = list(dict.fromkeys(all_download_tickers))
 
     try:
         raw = yf.download(
-            tickers=tickers,
+            tickers=all_download_tickers,
             period=period,
             interval=interval,
             auto_adjust=False,
@@ -335,18 +429,27 @@ def download_market_data(period: str = "2y", interval: str = "1d") -> Dict[str, 
         return {}
 
     result: Dict[str, pd.DataFrame] = {}
+    if not isinstance(raw.columns, pd.MultiIndex):
+        return result
 
-    if isinstance(raw.columns, pd.MultiIndex):
-        level0 = raw.columns.get_level_values(0)
+    level0 = raw.columns.get_level_values(0)
 
-        for key, meta in MARKET_TICKERS.items():
-            tk = meta["ticker"]
+    for key, meta in MARKET_TICKERS.items():
+        ticker_candidates = meta["ticker"] if isinstance(meta["ticker"], list) else [meta["ticker"]]
+        selected_df = None
+
+        for tk in ticker_candidates:
             if tk in level0:
                 df = raw[tk].copy()
                 df.columns = [str(c) for c in df.columns]
                 if "Close" in df.columns:
                     df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-                result[key] = df
+                    if df["Close"].dropna().shape[0] > 0:
+                        selected_df = df
+                        break
+
+        if selected_df is not None:
+            result[key] = selected_df
 
     return result
 
@@ -512,8 +615,39 @@ def make_risk_bar_chart(score_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def make_category_bar_chart(df: pd.DataFrame) -> go.Figure:
+    if df.empty:
+        fig = go.Figure()
+        fig.update_layout(template="plotly_white", height=320, title="No category data")
+        return fig
+
+    grouped = (
+        df.groupby("Category", as_index=False)["Risk Score"]
+        .mean()
+        .sort_values("Risk Score", ascending=False)
+    )
+
+    fig = go.Figure(
+        go.Bar(
+            x=grouped["Category"],
+            y=grouped["Risk Score"],
+            text=np.round(grouped["Risk Score"], 2),
+            textposition="outside",
+        )
+    )
+    fig.update_layout(
+        title="Category Risk Score",
+        xaxis_title="Category",
+        yaxis_title="Average Risk Score",
+        template="plotly_white",
+        height=360,
+        margin=dict(l=30, r=30, t=60, b=30),
+    )
+    return fig
+
+
 # ============================================================
-# FRED macro logic
+# FRED logic
 # ============================================================
 def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object]:
     meta = FRED_SERIES[series_id]
@@ -521,21 +655,28 @@ def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object
 
     if len(s) < 12:
         return {
+            "Series ID": series_id,
             "Indicator": meta["name"],
             "Category": meta["category"],
             "Latest": np.nan,
-            "1M %Chg": np.nan,
+            "Short %Chg": np.nan,
+            "YoY %Chg": np.nan,
             "Trend": "N/A",
             "Risk Score": 0,
             "Comment": "Not enough data",
         }
 
     latest = float(s.iloc[-1])
-    one_month_change = safe_pct_change(s, periods=min(1, len(s) - 1))
-    recent_12 = s.iloc[-12:]
-    q75 = recent_12.quantile(0.75)
+    short_change = compute_short_change(s, series_id)
+    yoy_change = compute_yoy_change(s, series_id)
+
+    recent_window = s.iloc[-min(len(s), 24):]
+    q25 = recent_window.quantile(0.25)
+    q75 = recent_window.quantile(0.75)
+    med = recent_window.median()
 
     risk_score = 0
+    comment = meta["description"]
 
     if series_id == "T10Y2Y":
         if latest < 0:
@@ -553,31 +694,56 @@ def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object
             risk_score = 1
         else:
             risk_score = 0
-        comment = "Credit spread widening signals financial stress."
+        comment = "Wider HY spread indicates rising credit stress."
+
+    elif series_id == "BAMLC0A0CM":
+        if latest > 3.5:
+            risk_score = 2
+        elif latest > 2.5:
+            risk_score = 1
+        else:
+            risk_score = 0
+        comment = "Broader corporate credit stress gauge."
 
     elif series_id == "UNRATE":
-        med = recent_12.median()
         if latest > q75:
             risk_score = 2
         elif latest > med:
             risk_score = 1
         else:
             risk_score = 0
-        comment = "Rising unemployment suggests weakening macro conditions."
+        comment = "Rising unemployment suggests macro weakening."
+
+    elif series_id == "ICSA":
+        if latest > q75:
+            risk_score = 2
+        elif latest > med:
+            risk_score = 1
+        else:
+            risk_score = 0
+        comment = "Higher jobless claims can warn of labor stress."
 
     elif series_id == "CPIAUCSL":
-        yoy = safe_pct_change(s, periods=min(12, len(s) - 1))
-        yoy = 0 if yoy is None else yoy
+        yoy = 0 if yoy_change is None else yoy_change
         if yoy > 4.0:
             risk_score = 2
         elif yoy > 2.5:
             risk_score = 1
         else:
             risk_score = 0
-        comment = f"Inflation pressure check based on YoY CPI: {format_num(yoy)}%."
+        comment = f"CPI inflation YoY: {format_num(yoy)}%."
+
+    elif series_id == "PCEPI":
+        yoy = 0 if yoy_change is None else yoy_change
+        if yoy > 3.5:
+            risk_score = 2
+        elif yoy > 2.3:
+            risk_score = 1
+        else:
+            risk_score = 0
+        comment = f"PCE inflation YoY: {format_num(yoy)}%."
 
     elif series_id == "FEDFUNDS":
-        med = recent_12.median()
         if latest > q75:
             risk_score = 2
         elif latest > med:
@@ -593,26 +759,72 @@ def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object
             risk_score = 0
         comment = "Higher long yields can compress valuation multiples."
 
+    elif series_id == "DGS2":
+        if latest > q75:
+            risk_score = 1
+        else:
+            risk_score = 0
+        comment = "Higher short yields reflect tighter policy expectations."
+
     elif series_id == "M2SL":
-        yoy = safe_pct_change(s, periods=min(12, len(s) - 1))
-        yoy = 0 if yoy is None else yoy
+        yoy = 0 if yoy_change is None else yoy_change
         if yoy < 0:
             risk_score = 2
         elif yoy < 3.0:
             risk_score = 1
         else:
             risk_score = 0
-        comment = f"Liquidity backdrop from M2 YoY: {format_num(yoy)}%."
+        comment = f"M2 YoY liquidity backdrop: {format_num(yoy)}%."
 
-    else:
-        comment = meta["description"]
+    elif series_id == "WALCL":
+        short = 0 if short_change is None else short_change
+        if short < -2.0:
+            risk_score = 2
+        elif short < 0:
+            risk_score = 1
+        else:
+            risk_score = 0
+        comment = f"Fed balance sheet short-term change: {format_num(short)}%."
+
+    elif series_id == "RRPONTSYD":
+        short = 0 if short_change is None else short_change
+        if latest > q75 and short > 0:
+            risk_score = 1
+        else:
+            risk_score = 0
+        comment = "Elevated reverse repo can reflect excess liquidity parking."
+
+    elif series_id == "WTREGEN":
+        short = 0 if short_change is None else short_change
+        if short > 10:
+            risk_score = 1
+            comment = "Rising TGA can drain liquidity from markets."
+        else:
+            risk_score = 0
+            comment = "TGA not showing material liquidity drain."
+
+    elif series_id == "PAYEMS":
+        yoy = 0 if yoy_change is None else yoy_change
+        if yoy < 0:
+            risk_score = 2
+        elif yoy < 1.0:
+            risk_score = 1
+        else:
+            risk_score = 0
+        comment = f"Payroll growth YoY: {format_num(yoy)}%."
+
+    elif series_id == "USREC":
+        risk_score = 2 if latest >= 1 else 0
+        comment = "Official recession indicator."
 
     return {
+        "Series ID": series_id,
         "Indicator": meta["name"],
         "Category": meta["category"],
         "Latest": latest,
-        "1M %Chg": one_month_change,
-        "Trend": momentum_label(one_month_change),
+        "Short %Chg": short_change,
+        "YoY %Chg": yoy_change,
+        "Trend": momentum_label(short_change),
         "Risk Score": risk_score,
         "Comment": comment,
     }
@@ -632,9 +844,9 @@ def build_macro_scorecard(fred_data: Dict[str, pd.DataFrame]):
     score_df = pd.DataFrame(rows)
 
     label, icon = score_to_label(total_score)
-    if total_score <= 2:
+    if total_score <= 4:
         timing_view = "Risk-on / constructive backdrop"
-    elif total_score <= 4:
+    elif total_score <= 9:
         timing_view = "Balanced / selective allocation"
     else:
         timing_view = "Defensive / risk management priority"
@@ -642,10 +854,16 @@ def build_macro_scorecard(fred_data: Dict[str, pd.DataFrame]):
     return score_df, total_score, label, f"{icon} {timing_view}"
 
 
+def filter_category(score_df: pd.DataFrame, category: str) -> pd.DataFrame:
+    if score_df.empty:
+        return pd.DataFrame()
+    return score_df[score_df["Category"] == category].copy()
+
+
 # ============================================================
-# Market summary + chart helpers
+# Market summary helpers
 # ============================================================
-def build_market_summary_table(data_dict: Dict[str, pd.DataFrame], keys: list[str], period_label: str) -> pd.DataFrame:
+def build_market_summary_table(data_dict: Dict[str, pd.DataFrame], keys: List[str], period_label: str) -> pd.DataFrame:
     rows = []
     period_days = get_period_days(period_label)
 
@@ -701,7 +919,7 @@ def build_market_summary_table(data_dict: Dict[str, pd.DataFrame], keys: list[st
     return pd.DataFrame(rows)
 
 
-def render_market_chart(data_dict: Dict[str, pd.DataFrame], key: str):
+def render_market_chart(data_dict: Dict[str, pd.DataFrame], key: str, show_debug: bool):
     meta = MARKET_TICKERS[key]
 
     if key not in data_dict or data_dict[key].empty:
@@ -724,7 +942,9 @@ def render_market_chart(data_dict: Dict[str, pd.DataFrame], key: str):
 
     if show_debug:
         with st.expander(f"Debug: {meta['label']}"):
+            st.write("Ticker source:", meta["ticker"])
             st.write("Columns:", df.columns.tolist())
+            st.write("Valid close count:", int(df["Close"].dropna().shape[0]) if "Close" in df.columns else 0)
             st.dataframe(df.head(), use_container_width=True)
 
 
@@ -756,6 +976,12 @@ with st.sidebar:
         index=0,
     )
 
+    fred_start_date = st.selectbox(
+        "FRED start date",
+        options=["2000-01-01", "2008-01-01", "2010-01-01", "2015-01-01", "2020-01-01"],
+        index=2,
+    )
+
     selected_detail_series = st.multiselect(
         "FRED detail indicators",
         options=list(FRED_SERIES.keys()),
@@ -780,10 +1006,18 @@ if auto_refresh:
 
 
 # ============================================================
+# Reload helper for start date
+# ============================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_all_fred_data_with_start(start_date: str) -> Dict[str, pd.DataFrame]:
+    return {sid: fetch_fred_series(sid, start_date=start_date) for sid in FRED_SERIES.keys()}
+
+
+# ============================================================
 # Load data
 # ============================================================
 market_data = download_market_data(period=market_period, interval=market_interval)
-fred_data = load_all_fred_data() if FRED_API_KEY else {}
+fred_data = load_all_fred_data_with_start(fred_start_date) if FRED_API_KEY else {}
 
 st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -817,11 +1051,11 @@ def render_market_tab():
         st.markdown("### FX Charts")
         col1, col2 = st.columns(2)
         with col1:
-            render_market_chart(market_data, "USDKRW")
-            render_market_chart(market_data, "EURUSD")
+            render_market_chart(market_data, "USDKRW", show_debug)
+            render_market_chart(market_data, "EURUSD", show_debug)
         with col2:
-            render_market_chart(market_data, "EURKRW")
-            render_market_chart(market_data, "DXY")
+            render_market_chart(market_data, "EURKRW", show_debug)
+            render_market_chart(market_data, "DXY", show_debug)
 
     with sub_macro:
         macro_keys = ["BTCEUR", "WTI", "BRENT", "GOLD", "SILVER", "NATGAS"]
@@ -844,13 +1078,36 @@ def render_market_tab():
         st.markdown("### Macro Asset Charts")
         col1, col2 = st.columns(2)
         with col1:
-            render_market_chart(market_data, "BTCEUR")
-            render_market_chart(market_data, "WTI")
-            render_market_chart(market_data, "GOLD")
+            render_market_chart(market_data, "BTCEUR", show_debug)
+            render_market_chart(market_data, "WTI", show_debug)
+            render_market_chart(market_data, "GOLD", show_debug)
         with col2:
-            render_market_chart(market_data, "BRENT")
-            render_market_chart(market_data, "SILVER")
-            render_market_chart(market_data, "NATGAS")
+            render_market_chart(market_data, "BRENT", show_debug)
+            render_market_chart(market_data, "SILVER", show_debug)
+            render_market_chart(market_data, "NATGAS", show_debug)
+
+
+def render_fred_category_section(score_df: pd.DataFrame, fred_data: Dict[str, pd.DataFrame], category: str):
+    cat_df = filter_category(score_df, category)
+    st.markdown(f"### {category} Snapshot")
+
+    if cat_df.empty:
+        st.info(f"No {category} data available.")
+        return
+
+    st.dataframe(
+        cat_df[["Indicator", "Latest", "Short %Chg", "YoY %Chg", "Trend", "Risk Score", "Comment"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    series_ids = cat_df["Series ID"].tolist()
+    cols = st.columns(2)
+    for idx, sid in enumerate(series_ids):
+        with cols[idx % 2]:
+            df = fred_data.get(sid, pd.DataFrame())
+            if not df.empty:
+                st.plotly_chart(make_fred_chart(df, FRED_SERIES[sid]["name"]), use_container_width=True)
 
 
 def render_fred_macro_tab():
@@ -871,30 +1128,63 @@ def render_fred_macro_tab():
     c2.metric("Risk Regime", risk_label)
     c3.metric("Investment Timing View", timing_view)
 
-    st.markdown("### Macro Scorecard")
-    st.dataframe(
-        score_df[["Indicator", "Category", "Latest", "1M %Chg", "Trend", "Risk Score", "Comment"]],
-        use_container_width=True,
-        hide_index=True,
-    )
+    sub_tabs = st.tabs(["Overview", "Liquidity", "Rates", "Credit", "Inflation", "Labor", "Recession"])
 
-    st.plotly_chart(make_risk_bar_chart(score_df), use_container_width=True)
+    with sub_tabs[0]:
+        st.markdown("### Macro Scorecard")
+        st.dataframe(
+            score_df[["Category", "Indicator", "Latest", "Short %Chg", "YoY %Chg", "Trend", "Risk Score", "Comment"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
-    with st.expander("Macro Interpretation"):
-        st.markdown(
-            f"""
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.plotly_chart(make_risk_bar_chart(score_df), use_container_width=True)
+        with col_b:
+            st.plotly_chart(make_category_bar_chart(score_df), use_container_width=True)
+
+        category_scores = (
+            score_df.groupby("Category", as_index=False)["Risk Score"]
+            .mean()
+            .sort_values("Category")
+        )
+        st.markdown("### Category Summary")
+        st.dataframe(category_scores, use_container_width=True, hide_index=True)
+
+        with st.expander("Macro Interpretation"):
+            st.markdown(
+                f"""
 **Current regime:** {risk_label}  
 **Investment timing view:** {timing_view}
 
-Suggested integration point for your earlier FRED dashboard:
-- Liquidity block
-- Rates block
-- Credit block
-- Inflation block
-- Recession warning block
-- Asset allocation implication
+Interpretation guide:
+- **Liquidity:** shrinking liquidity is usually a headwind for equities and crypto.
+- **Rates:** higher rates pressure valuation multiples and financing conditions.
+- **Credit:** wider spreads imply rising stress.
+- **Inflation:** sticky inflation reduces room for easing.
+- **Labor:** weaker labor data can confirm slowdown.
+- **Recession:** inversion and labor deterioration increase downturn risk.
 """
-        )
+            )
+
+    with sub_tabs[1]:
+        render_fred_category_section(score_df, fred_data, "Liquidity")
+
+    with sub_tabs[2]:
+        render_fred_category_section(score_df, fred_data, "Rates")
+
+    with sub_tabs[3]:
+        render_fred_category_section(score_df, fred_data, "Credit")
+
+    with sub_tabs[4]:
+        render_fred_category_section(score_df, fred_data, "Inflation")
+
+    with sub_tabs[5]:
+        render_fred_category_section(score_df, fred_data, "Labor")
+
+    with sub_tabs[6]:
+        render_fred_category_section(score_df, fred_data, "Recession")
 
 
 def render_fred_detail_tab():
@@ -917,12 +1207,15 @@ def render_fred_detail_tab():
         meta = FRED_SERIES[sid]
         latest, prev = latest_and_prev(df["value"])
         delta = None if latest is None or prev is None else latest - prev
+        short_pct = compute_short_change(df["value"], sid)
+        yoy_pct = compute_yoy_change(df["value"], sid)
 
         st.markdown(f"### {meta['name']}")
-        c1, c2, c3 = st.columns([1, 1, 3])
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
         c1.metric("Latest", format_num(latest, 2))
         c2.metric("Change", format_num(delta, 2) if delta is not None else "N/A")
-        c3.markdown(f"**Why it matters:** {meta['description']}")
+        c3.metric("YoY %", format_pct(yoy_pct, 2))
+        c4.markdown(f"**Why it matters:** {meta['description']}")
 
         st.plotly_chart(make_fred_chart(df, meta["name"]), use_container_width=True)
 
@@ -952,34 +1245,33 @@ with st.expander("Suggested Next Updates"):
         """
 ### Recommended upgrades
 
-1. Add mini comparison charts
-   - BTC vs Gold
-   - WTI vs Brent
-   - DXY vs USD/KRW
-
-2. Add correlation block
-   - 30D rolling correlation
-   - 90D rolling correlation
-
-3. Add alert thresholds
-   - USD/KRW alert
-   - EUR/KRW alert
-   - Oil spike alert
-   - DXY breakout alert
-
-4. Add relative performance summary
+1. Add relative performance summary
    - 1M / 3M / 6M / 1Y returns table
 
-5. Add Germany / Korea interpretation cards
+2. Add cross-market comparison charts
+   - DXY vs USD/KRW
+   - Gold vs BTC
+   - WTI vs Brent
+
+3. Add rolling correlation panel
+   - 30D / 90D correlation
+
+4. Add alert thresholds
+   - USD/KRW breakout
+   - EUR/KRW breakout
+   - HY spread spike
+   - Yield curve inversion
+
+5. Add portfolio implication section
+   - Equity
+   - Bonds
+   - Gold
+   - Commodities
+   - Cash
+
+6. Add Germany / Korea interpretation cards
    - KRW weakness warning
    - EUR strength and living cost pressure
    - Oil price and inflation burden
-
-6. Merge your previous FRED dashboard blocks
-   - Liquidity
-   - Rates
-   - Credit
-   - Inflation
-   - Recession
 """
     )
