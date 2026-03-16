@@ -6,16 +6,10 @@
 # - Tab 3: FRED Detail Charts
 #
 # FX & Macro Market Monitoring:
-# - USD/KRW
-# - EUR/KRW
-# - EUR/USD
-# - DXY
-# - BTC/EUR
-# - WTI Oil
-# - Brent Oil
-# - Gold
-# - Silver
-# - Natural Gas
+# - Summary table first
+# - Charts shown below
+# - USD/KRW, EUR/KRW, EUR/USD, DXY
+# - BTC/EUR, WTI, Brent, Gold, Silver, Natural Gas
 #
 # Features:
 # - Flexible period / interval selection
@@ -23,7 +17,7 @@
 # - Moving averages
 # - 52-week range position
 # - Z-score
-# - Simple macro interpretation
+# - Compact summary table
 #
 # Run:
 #   streamlit run streamlit_app.py
@@ -71,13 +65,11 @@ def get_fred_api_key() -> str:
     key = os.getenv("FRED_API_KEY", "")
     if key:
         return key
-
     try:
         if "FRED_API_KEY" in st.secrets:
             return st.secrets["FRED_API_KEY"]
     except Exception:
         pass
-
     return ""
 
 
@@ -192,13 +184,10 @@ def safe_pct_change(series: pd.Series, periods: int = 1) -> Optional[float]:
     s = pd.to_numeric(series, errors="coerce").dropna()
     if len(s) <= periods:
         return None
-
     prev = s.iloc[-1 - periods]
     curr = s.iloc[-1]
-
     if prev == 0 or pd.isna(prev) or pd.isna(curr):
         return None
-
     return (curr / prev - 1.0) * 100.0
 
 
@@ -280,12 +269,10 @@ def calc_zscore(series: pd.Series, window: int = 60) -> Optional[float]:
 
 def calc_range_position(series: pd.Series, window: int = 252) -> Optional[float]:
     s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < min(window, len(s)):
-        window = len(s)
-
-    if window < 2:
+    if len(s) < 2:
         return None
 
+    window = min(window, len(s))
     recent = s.iloc[-window:]
     low_val = recent.min()
     high_val = recent.max()
@@ -360,12 +347,6 @@ def download_market_data(period: str = "2y", interval: str = "1d") -> Dict[str, 
                 if "Close" in df.columns:
                     df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
                 result[key] = df
-    else:
-        # fallback for unexpected single ticker structure
-        cols = [str(c) for c in raw.columns]
-        raw.columns = cols
-        if "Close" in raw.columns:
-            raw["Close"] = pd.to_numeric(raw["Close"], errors="coerce")
 
     return result
 
@@ -435,7 +416,7 @@ def make_line_chart(
         fig.update_layout(
             title=f"{title} (Missing column: {y_col})",
             template="plotly_white",
-            height=420,
+            height=380,
         )
         return fig
 
@@ -662,6 +643,92 @@ def build_macro_scorecard(fred_data: Dict[str, pd.DataFrame]):
 
 
 # ============================================================
+# Market summary + chart helpers
+# ============================================================
+def build_market_summary_table(data_dict: Dict[str, pd.DataFrame], keys: list[str], period_label: str) -> pd.DataFrame:
+    rows = []
+    period_days = get_period_days(period_label)
+
+    for key in keys:
+        meta = MARKET_TICKERS[key]
+
+        if key not in data_dict or data_dict[key].empty:
+            rows.append({
+                "Asset": meta["label"],
+                "Latest": np.nan,
+                "1-Step %": np.nan,
+                "Z-score(60)": np.nan,
+                "Range Pos(52W)": np.nan,
+                "From High": np.nan,
+                "Interpretation": "Data not available",
+            })
+            continue
+
+        df = normalize_time_column(data_dict[key])
+        df = ensure_numeric_column(df, "Close")
+        valid = df["Close"].dropna()
+
+        if len(valid) == 0:
+            rows.append({
+                "Asset": meta["label"],
+                "Latest": np.nan,
+                "1-Step %": np.nan,
+                "Z-score(60)": np.nan,
+                "Range Pos(52W)": np.nan,
+                "From High": np.nan,
+                "Interpretation": "No valid close data",
+            })
+            continue
+
+        latest = valid.iloc[-1]
+        prev = valid.iloc[-2] if len(valid) > 1 else np.nan
+        delta_pct = (latest / prev - 1.0) * 100.0 if pd.notna(prev) and prev != 0 else np.nan
+
+        z60 = calc_zscore(valid, window=60)
+        range_pos = calc_range_position(valid, window=min(252, period_days))
+        dd_high = calc_drawdown_from_high(valid, window=min(252, period_days))
+
+        rows.append({
+            "Asset": meta["label"],
+            "Latest": round(float(latest), 2) if pd.notna(latest) else np.nan,
+            "1-Step %": round(float(delta_pct), 2) if pd.notna(delta_pct) else np.nan,
+            "Z-score(60)": round(float(z60), 2) if z60 is not None else np.nan,
+            "Range Pos(52W)": round(float(range_pos), 1) if range_pos is not None else np.nan,
+            "From High": round(float(dd_high), 1) if dd_high is not None else np.nan,
+            "Interpretation": meta["interpretation"],
+        })
+
+    return pd.DataFrame(rows)
+
+
+def render_market_chart(data_dict: Dict[str, pd.DataFrame], key: str):
+    meta = MARKET_TICKERS[key]
+
+    if key not in data_dict or data_dict[key].empty:
+        st.warning(f"{meta['label']} data not available.")
+        return
+
+    df = normalize_time_column(data_dict[key])
+    df = ensure_numeric_column(df, "Close")
+
+    st.markdown(f"### {meta['label']}")
+    fig = make_line_chart(
+        df=df,
+        x_col="Time",
+        y_col="Close",
+        title=meta["label"],
+        y_title=meta["y_title"],
+        show_ma=True,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    if show_debug:
+        with st.expander(f"Debug: {meta['label']}"):
+            st.write("Columns:", df.columns.tolist())
+            st.dataframe(df.head(), use_container_width=True)
+
+
+# ============================================================
 # Sidebar
 # ============================================================
 with st.sidebar:
@@ -722,59 +789,6 @@ st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 # ============================================================
-# Market render helpers
-# ============================================================
-def render_market_card(data_dict: Dict[str, pd.DataFrame], key: str):
-    meta = MARKET_TICKERS[key]
-
-    if key not in data_dict or data_dict[key].empty:
-        st.warning(f"{meta['label']} data not available.")
-        return
-
-    df = normalize_time_column(data_dict[key])
-    df = ensure_numeric_column(df, "Close")
-
-    valid = df["Close"].dropna()
-    latest = valid.iloc[-1] if len(valid) else np.nan
-    prev = valid.iloc[-2] if len(valid) > 1 else np.nan
-    delta = latest - prev if pd.notna(latest) and pd.notna(prev) else np.nan
-    delta_pct = (latest / prev - 1.0) * 100.0 if pd.notna(latest) and pd.notna(prev) and prev != 0 else np.nan
-
-    z60 = calc_zscore(df["Close"], window=60)
-    period_days = get_period_days(market_period)
-    range_pos = calc_range_position(df["Close"], window=min(252, period_days))
-    dd_high = calc_drawdown_from_high(df["Close"], window=min(252, period_days))
-
-    st.markdown(f"### {meta['label']}")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Latest", format_num(latest, 2))
-    c2.metric("1-Step Change", format_num(delta, 2) if pd.notna(delta) else "N/A")
-    c3.metric("1-Step %", format_pct(delta_pct, 2))
-    c4.metric("Z-score (60)", format_num(z60, 2))
-
-    c5, c6 = st.columns(2)
-    c5.metric("52W Range Position", format_pct(range_pos, 1))
-    c6.metric("From Recent High", format_pct(dd_high, 1))
-
-    fig = make_line_chart(
-        df=df,
-        x_col="Time",
-        y_col="Close",
-        title=meta["label"],
-        y_title=meta["y_title"],
-        show_ma=True,
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.info(meta["interpretation"])
-
-    if show_debug:
-        with st.expander(f"Debug: {meta['label']}"):
-            st.write("Columns:", df.columns.tolist())
-            st.dataframe(df.head(), use_container_width=True)
-
-
-# ============================================================
 # Render functions
 # ============================================================
 def render_market_tab():
@@ -783,24 +797,60 @@ def render_market_tab():
     sub_fx, sub_macro = st.tabs(["FX", "Macro Assets"])
 
     with sub_fx:
+        fx_keys = ["USDKRW", "EURKRW", "EURUSD", "DXY"]
+
+        st.markdown("### FX Summary")
+        fx_summary = build_market_summary_table(market_data, fx_keys, market_period)
+        st.dataframe(
+            fx_summary[["Asset", "Latest", "1-Step %", "Z-score(60)", "Range Pos(52W)", "From High"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("FX Interpretation"):
+            st.dataframe(
+                fx_summary[["Asset", "Interpretation"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("### FX Charts")
         col1, col2 = st.columns(2)
         with col1:
-            render_market_card(market_data, "USDKRW")
-            render_market_card(market_data, "EURUSD")
+            render_market_chart(market_data, "USDKRW")
+            render_market_chart(market_data, "EURUSD")
         with col2:
-            render_market_card(market_data, "EURKRW")
-            render_market_card(market_data, "DXY")
+            render_market_chart(market_data, "EURKRW")
+            render_market_chart(market_data, "DXY")
 
     with sub_macro:
+        macro_keys = ["BTCEUR", "WTI", "BRENT", "GOLD", "SILVER", "NATGAS"]
+
+        st.markdown("### Macro Asset Summary")
+        macro_summary = build_market_summary_table(market_data, macro_keys, market_period)
+        st.dataframe(
+            macro_summary[["Asset", "Latest", "1-Step %", "Z-score(60)", "Range Pos(52W)", "From High"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("Macro Asset Interpretation"):
+            st.dataframe(
+                macro_summary[["Asset", "Interpretation"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("### Macro Asset Charts")
         col1, col2 = st.columns(2)
         with col1:
-            render_market_card(market_data, "BTCEUR")
-            render_market_card(market_data, "WTI")
-            render_market_card(market_data, "GOLD")
+            render_market_chart(market_data, "BTCEUR")
+            render_market_chart(market_data, "WTI")
+            render_market_chart(market_data, "GOLD")
         with col2:
-            render_market_card(market_data, "BRENT")
-            render_market_card(market_data, "SILVER")
-            render_market_card(market_data, "NATGAS")
+            render_market_chart(market_data, "BRENT")
+            render_market_chart(market_data, "SILVER")
+            render_market_chart(market_data, "NATGAS")
 
 
 def render_fred_macro_tab():
