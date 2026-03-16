@@ -6,6 +6,7 @@
 # - Flexible module positioning
 # - FX charts: USD/KRW, KRW/EUR
 # - FRED-based investment timing / risk analysis
+# - Safer time-column handling for yfinance output
 #
 # Run:
 #   streamlit run streamlit_app.py
@@ -16,15 +17,15 @@
 # Optional:
 #   Set FRED_API_KEY in environment variables
 #   or .streamlit/secrets.toml
-#   FRED_API_KEY="YOUR_API_KEY"
+#   FRED_API_KEY="YOUR_FRED_API_KEY"
 # ============================================================
 
 from __future__ import annotations
 
 import os
 import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -32,6 +33,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
+
 
 # ============================================================
 # Page setup
@@ -49,71 +51,80 @@ st.caption("Real-time FX monitoring + FRED-based macro risk and investment timin
 # ============================================================
 # Config
 # ============================================================
-FRED_API_KEY = os.getenv("FRED_API_KEY", st.secrets.get("FRED_API_KEY", "")) if hasattr(st, "secrets") else os.getenv("FRED_API_KEY", "")
-TODAY = datetime.today().date()
+def get_fred_api_key() -> str:
+    key = os.getenv("FRED_API_KEY", "")
+    if key:
+        return key
+
+    try:
+        if "FRED_API_KEY" in st.secrets:
+            return st.secrets["FRED_API_KEY"]
+    except Exception:
+        pass
+
+    return ""
+
+
+FRED_API_KEY = get_fred_api_key()
 
 FRED_SERIES = {
     "DGS10": {
         "name": "US 10Y Treasury Yield",
         "category": "Rates",
-        "higher_risk": "mixed",
         "description": "Higher long-term yields can pressure equity valuations and tighten financial conditions.",
     },
     "FEDFUNDS": {
         "name": "Fed Funds Rate",
         "category": "Rates",
-        "higher_risk": "yes",
         "description": "Higher policy rates generally increase financing costs and reduce liquidity.",
     },
     "T10Y2Y": {
         "name": "10Y - 2Y Treasury Spread",
         "category": "Yield Curve",
-        "higher_risk": "no",
         "description": "Deep inversion often signals recession risk.",
     },
     "M2SL": {
         "name": "M2 Money Supply",
         "category": "Liquidity",
-        "higher_risk": "no",
         "description": "A stronger money/liquidity backdrop can be supportive for risk assets.",
     },
     "CPIAUCSL": {
         "name": "CPI (All Urban Consumers)",
         "category": "Inflation",
-        "higher_risk": "yes",
         "description": "Higher inflation can pressure bonds and force tighter policy.",
     },
     "UNRATE": {
         "name": "US Unemployment Rate",
         "category": "Labor",
-        "higher_risk": "yes",
         "description": "Rising unemployment can reflect economic slowdown or recession stress.",
     },
     "BAMLH0A0HYM2": {
         "name": "High Yield OAS",
         "category": "Credit",
-        "higher_risk": "yes",
         "description": "Wider credit spreads indicate rising financial stress and risk aversion.",
     },
 }
 
 
 # ============================================================
-# Helpers
+# Helper functions
 # ============================================================
 def safe_pct_change(series: pd.Series, periods: int = 1) -> Optional[float]:
-    if series is None or len(series.dropna()) <= periods:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) <= periods:
         return None
-    s = series.dropna()
+
     prev = s.iloc[-1 - periods]
     curr = s.iloc[-1]
-    if prev == 0:
+
+    if prev == 0 or pd.isna(prev) or pd.isna(curr):
         return None
+
     return (curr / prev - 1.0) * 100.0
 
 
 def latest_and_prev(series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
-    s = series.dropna()
+    s = pd.to_numeric(series, errors="coerce").dropna()
     if len(s) < 2:
         return None, None
     return float(s.iloc[-1]), float(s.iloc[-2])
@@ -128,20 +139,49 @@ def format_num(x: Optional[float], ndigits: int = 2) -> str:
 def score_to_label(score: int) -> Tuple[str, str]:
     if score <= 2:
         return "Low Risk", "🟢"
-    elif score <= 4:
+    if score <= 4:
         return "Moderate Risk", "🟡"
-    else:
-        return "High Risk", "🔴"
+    return "High Risk", "🔴"
 
 
 def momentum_label(value: Optional[float]) -> str:
-    if value is None:
+    if value is None or pd.isna(value):
         return "N/A"
     if value > 0:
         return "Improving"
-    elif value < 0:
+    if value < 0:
         return "Deteriorating"
     return "Flat"
+
+
+def normalize_time_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Makes the first time-like column consistently named as 'Time'.
+    Works for yfinance outputs where the index name may vary:
+    Date / Datetime / index / unnamed.
+    """
+    out = df.copy().reset_index()
+
+    possible_time_cols = ["Date", "Datetime", "date", "datetime", "index"]
+
+    found = None
+    for col in possible_time_cols:
+        if col in out.columns:
+            found = col
+            break
+
+    if found is None:
+        found = out.columns[0]
+
+    out = out.rename(columns={found: "Time"})
+    return out
+
+
+def ensure_numeric_column(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    out = df.copy()
+    if col in out.columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
 
 
 # ============================================================
@@ -155,33 +195,51 @@ def download_fx_data(period: str = "2y", interval: str = "1d") -> Dict[str, pd.D
     - EUR/KRW = EURKRW=X  -> KRW/EUR = 1 / (EUR/KRW)
     """
     tickers = ["KRW=X", "EURKRW=X"]
-    raw = yf.download(
-        tickers=tickers,
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        group_by="ticker",
-        threads=True,
-    )
 
-    result = {}
+    try:
+        raw = yf.download(
+            tickers=tickers,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            group_by="ticker",
+            threads=True,
+        )
+    except Exception:
+        return {}
 
-    # USD/KRW
-    if "KRW=X" in raw.columns.get_level_values(0):
-        fx1 = raw["KRW=X"].copy()
-        fx1 = fx1.rename(columns=str)
-        fx1["Close"] = pd.to_numeric(fx1["Close"], errors="coerce")
-        result["USDKRW"] = fx1
+    result: Dict[str, pd.DataFrame] = {}
 
-    # KRW/EUR from EUR/KRW inverse
-    if "EURKRW=X" in raw.columns.get_level_values(0):
-        fx2 = raw["EURKRW=X"].copy()
-        fx2 = fx2.rename(columns=str)
-        fx2["Close"] = pd.to_numeric(fx2["Close"], errors="coerce")
-        fx2["KRW_per_EUR"] = fx2["Close"]
-        fx2["EUR_per_KRW"] = 1.0 / fx2["KRW_per_EUR"]
-        result["KRWEUR"] = fx2
+    if isinstance(raw.columns, pd.MultiIndex):
+        # USD/KRW
+        if "KRW=X" in raw.columns.get_level_values(0):
+            fx1 = raw["KRW=X"].copy()
+            fx1.columns = [str(c) for c in fx1.columns]
+            fx1 = ensure_numeric_column(fx1, "Close")
+            result["USDKRW"] = fx1
+
+        # EUR/KRW -> KRW/EUR
+        if "EURKRW=X" in raw.columns.get_level_values(0):
+            fx2 = raw["EURKRW=X"].copy()
+            fx2.columns = [str(c) for c in fx2.columns]
+            fx2 = ensure_numeric_column(fx2, "Close")
+            fx2["KRW_per_EUR"] = fx2["Close"]
+            fx2["EUR_per_KRW"] = np.where(
+                pd.notna(fx2["KRW_per_EUR"]) & (fx2["KRW_per_EUR"] != 0),
+                1.0 / fx2["KRW_per_EUR"],
+                np.nan,
+            )
+            result["KRWEUR"] = fx2
+    else:
+        # Fallback in case yfinance returns a single-level structure
+        cols = [str(c) for c in raw.columns]
+        raw.columns = cols
+
+        if "Close" in raw.columns:
+            fx1 = raw.copy()
+            fx1 = ensure_numeric_column(fx1, "Close")
+            result["USDKRW"] = fx1
 
     return result
 
@@ -199,15 +257,21 @@ def fetch_fred_series(series_id: str, start_date: str = "2010-01-01") -> pd.Data
         "observation_start": start_date,
     }
 
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return pd.DataFrame(columns=["date", "value"])
 
     if "observations" not in data:
         return pd.DataFrame(columns=["date", "value"])
 
     df = pd.DataFrame(data["observations"])
-    df["date"] = pd.to_datetime(df["date"])
+    if df.empty:
+        return pd.DataFrame(columns=["date", "value"])
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     df = df[["date", "value"]].dropna().sort_values("date").reset_index(drop=True)
     return df
@@ -219,7 +283,7 @@ def load_all_fred_data() -> Dict[str, pd.DataFrame]:
 
 
 # ============================================================
-# Charts
+# Chart functions
 # ============================================================
 def make_line_chart(
     df: pd.DataFrame,
@@ -229,27 +293,48 @@ def make_line_chart(
     y_title: str,
     show_ma: bool = True,
 ) -> go.Figure:
+    data = df.copy()
+
+    if x_col not in data.columns:
+        fallback_cols = ["Time", "Date", "Datetime", "date", "datetime", "index"]
+        found = None
+        for col in fallback_cols:
+            if col in data.columns:
+                found = col
+                break
+        x_col = found if found is not None else data.columns[0]
+
+    if y_col not in data.columns:
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"{title} (No data column: {y_col})",
+            template="plotly_white",
+            height=420,
+        )
+        return fig
+
+    data[y_col] = pd.to_numeric(data[y_col], errors="coerce")
+
     fig = go.Figure()
 
     fig.add_trace(
         go.Scatter(
-            x=df[x_col],
-            y=df[y_col],
+            x=data[x_col],
+            y=data[y_col],
             mode="lines",
             name=y_title,
             line=dict(width=2),
         )
     )
 
-    if show_ma and len(df) >= 50:
-        df2 = df.copy()
-        df2["MA50"] = df2[y_col].rolling(50).mean()
-        df2["MA200"] = df2[y_col].rolling(200).mean()
+    if show_ma and len(data) >= 50:
+        data["MA50"] = data[y_col].rolling(50).mean()
+        data["MA200"] = data[y_col].rolling(200).mean()
 
         fig.add_trace(
             go.Scatter(
-                x=df2[x_col],
-                y=df2["MA50"],
+                x=data[x_col],
+                y=data["MA50"],
                 mode="lines",
                 name="MA50",
                 line=dict(width=1.5, dash="dot"),
@@ -257,8 +342,8 @@ def make_line_chart(
         )
         fig.add_trace(
             go.Scatter(
-                x=df2[x_col],
-                y=df2["MA200"],
+                x=data[x_col],
+                y=data["MA200"],
                 mode="lines",
                 name="MA200",
                 line=dict(width=1.5, dash="dash"),
@@ -326,7 +411,7 @@ def make_risk_bar_chart(score_df: pd.DataFrame) -> go.Figure:
 # ============================================================
 def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object]:
     meta = FRED_SERIES[series_id]
-    s = df["value"].dropna()
+    s = pd.to_numeric(df["value"], errors="coerce").dropna()
 
     if len(s) < 12:
         return {
@@ -342,16 +427,12 @@ def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object
     latest = float(s.iloc[-1])
     one_month_change = safe_pct_change(s, periods=min(1, len(s) - 1))
 
-    # rolling stats
     recent_12 = s.iloc[-12:]
-    q25 = recent_12.quantile(0.25)
     q75 = recent_12.quantile(0.75)
-    trend = momentum_label(one_month_change)
 
     risk_score = 0
 
     if series_id == "T10Y2Y":
-        # More negative = worse
         if latest < 0:
             risk_score = 2
         elif latest < 0.5:
@@ -359,6 +440,7 @@ def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object
         else:
             risk_score = 0
         comment = "Yield curve inversion increases recession risk." if latest < 0 else "Yield curve remains positive."
+
     elif series_id == "BAMLH0A0HYM2":
         if latest > 5.0:
             risk_score = 2
@@ -367,18 +449,20 @@ def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object
         else:
             risk_score = 0
         comment = "Credit spread widening signals financial stress."
+
     elif series_id == "UNRATE":
+        med = recent_12.median()
         if latest > q75:
             risk_score = 2
-        elif latest > recent_12.median():
+        elif latest > med:
             risk_score = 1
         else:
             risk_score = 0
         comment = "Rising unemployment suggests weakening macro conditions."
+
     elif series_id == "CPIAUCSL":
-        yoy = safe_pct_change(s, periods=min(12, len(s)-1))
-        if yoy is None:
-            yoy = 0
+        yoy = safe_pct_change(s, periods=min(12, len(s) - 1))
+        yoy = 0 if yoy is None else yoy
         if yoy > 4.0:
             risk_score = 2
         elif yoy > 2.5:
@@ -386,24 +470,27 @@ def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object
         else:
             risk_score = 0
         comment = f"Inflation pressure check based on YoY CPI: {format_num(yoy)}%."
+
     elif series_id == "FEDFUNDS":
+        med = recent_12.median()
         if latest > q75:
             risk_score = 2
-        elif latest > recent_12.median():
+        elif latest > med:
             risk_score = 1
         else:
             risk_score = 0
         comment = "Higher policy rates reduce liquidity."
+
     elif series_id == "DGS10":
         if latest > q75:
             risk_score = 1
         else:
             risk_score = 0
         comment = "Higher long yields can compress valuation multiples."
+
     elif series_id == "M2SL":
-        yoy = safe_pct_change(s, periods=min(12, len(s)-1))
-        if yoy is None:
-            yoy = 0
+        yoy = safe_pct_change(s, periods=min(12, len(s) - 1))
+        yoy = 0 if yoy is None else yoy
         if yoy < 0:
             risk_score = 2
         elif yoy < 3.0:
@@ -411,6 +498,7 @@ def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object
         else:
             risk_score = 0
         comment = f"Liquidity backdrop from M2 YoY: {format_num(yoy)}%."
+
     else:
         comment = meta["description"]
 
@@ -419,13 +507,13 @@ def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object
         "Category": meta["category"],
         "Latest": latest,
         "1M %Chg": one_month_change,
-        "Trend": trend,
+        "Trend": momentum_label(one_month_change),
         "Risk Score": risk_score,
         "Comment": comment,
     }
 
 
-def build_macro_scorecard(fred_data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, int, str, str]:
+def build_macro_scorecard(fred_data: Dict[str, pd.DataFrame]):
     rows = []
     total_score = 0
 
@@ -451,7 +539,7 @@ def build_macro_scorecard(fred_data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFr
 
 
 # ============================================================
-# Sidebar controls
+# Sidebar
 # ============================================================
 with st.sidebar:
     st.header("⚙️ Controls")
@@ -476,14 +564,9 @@ with st.sidebar:
     show_fx = st.checkbox("Show FX Monitoring", value=True)
     show_macro = st.checkbox("Show FRED Macro Dashboard", value=True)
     show_detail = st.checkbox("Show Indicator Detail Charts", value=True)
+    show_debug = st.checkbox("Show Debug Info", value=False)
 
     st.subheader("Module Positioning")
-    order_options = {
-        "FX Monitoring": 1,
-        "Macro Dashboard": 2,
-        "Detail Charts": 3,
-    }
-
     pos_fx = st.selectbox("Position - FX Monitoring", [1, 2, 3], index=0)
     pos_macro = st.selectbox("Position - Macro Dashboard", [1, 2, 3], index=1)
     pos_detail = st.selectbox("Position - Detail Charts", [1, 2, 3], index=2)
@@ -497,7 +580,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.caption("Tip: duplicate positions are allowed, but unique positions are recommended.")
+    st.caption("Tip: unique positions are recommended.")
 
 
 # ============================================================
@@ -518,10 +601,9 @@ if auto_refresh:
 # Load data
 # ============================================================
 fx_data = download_fx_data(period=period)
-
 fred_data = load_all_fred_data() if FRED_API_KEY else {}
-
 last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 st.caption(f"Last updated: {last_update}")
 
 
@@ -533,12 +615,14 @@ def render_fx_monitoring():
 
     col1, col2 = st.columns(2)
 
-    # USD/KRW
     with col1:
         if "USDKRW" in fx_data and not fx_data["USDKRW"].empty:
-            df = fx_data["USDKRW"].reset_index().rename(columns={"Date": "date"})
-            latest = df["Close"].dropna().iloc[-1] if len(df["Close"].dropna()) else np.nan
-            prev = df["Close"].dropna().iloc[-2] if len(df["Close"].dropna()) > 1 else np.nan
+            df = normalize_time_column(fx_data["USDKRW"])
+            df = ensure_numeric_column(df, "Close")
+
+            close_valid = df["Close"].dropna()
+            latest = close_valid.iloc[-1] if len(close_valid) else np.nan
+            prev = close_valid.iloc[-2] if len(close_valid) > 1 else np.nan
             delta = latest - prev if pd.notna(latest) and pd.notna(prev) else np.nan
 
             st.metric(
@@ -546,24 +630,32 @@ def render_fx_monitoring():
                 value=format_num(latest, 2),
                 delta=format_num(delta, 2) if pd.notna(delta) else "N/A",
             )
+
             fig = make_line_chart(
                 df=df,
-                x_col="Date",
+                x_col="Time",
                 y_col="Close",
                 title="USD / KRW Exchange Rate",
                 y_title="KRW per USD",
                 show_ma=True,
             )
             st.plotly_chart(fig, use_container_width=True)
+
+            if show_debug:
+                with st.expander("Debug: USD/KRW"):
+                    st.write("Columns:", df.columns.tolist())
+                    st.dataframe(df.head(), use_container_width=True)
         else:
             st.warning("USD/KRW data not available.")
 
-    # KRW/EUR
     with col2:
         if "KRWEUR" in fx_data and not fx_data["KRWEUR"].empty:
-            df = fx_data["KRWEUR"].reset_index().rename(columns={"Date": "date"})
-            latest = df["EUR_per_KRW"].dropna().iloc[-1] if len(df["EUR_per_KRW"].dropna()) else np.nan
-            prev = df["EUR_per_KRW"].dropna().iloc[-2] if len(df["EUR_per_KRW"].dropna()) > 1 else np.nan
+            df = normalize_time_column(fx_data["KRWEUR"])
+            df = ensure_numeric_column(df, "EUR_per_KRW")
+
+            eur_valid = df["EUR_per_KRW"].dropna()
+            latest = eur_valid.iloc[-1] if len(eur_valid) else np.nan
+            prev = eur_valid.iloc[-2] if len(eur_valid) > 1 else np.nan
             delta = latest - prev if pd.notna(latest) and pd.notna(prev) else np.nan
 
             st.metric(
@@ -571,21 +663,27 @@ def render_fx_monitoring():
                 value=f"{latest:.6f}" if pd.notna(latest) else "N/A",
                 delta=f"{delta:.6f}" if pd.notna(delta) else "N/A",
             )
+
             fig = make_line_chart(
                 df=df,
-                x_col="Date",
+                x_col="Time",
                 y_col="EUR_per_KRW",
                 title="KRW / EUR Exchange Rate",
                 y_title="EUR per KRW",
                 show_ma=True,
             )
             st.plotly_chart(fig, use_container_width=True)
+
+            if show_debug:
+                with st.expander("Debug: KRW/EUR"):
+                    st.write("Columns:", df.columns.tolist())
+                    st.dataframe(df.head(), use_container_width=True)
         else:
             st.warning("KRW/EUR data not available.")
 
     st.info(
         "Interpretation: USD/KRW helps monitor KRW weakness vs USD. "
-        "KRW/EUR helps track Korean won purchasing power relative to EUR-based expenses/investments."
+        "KRW/EUR helps track Korean won purchasing power relative to EUR-based expenses and investments."
     )
 
 
@@ -607,14 +705,17 @@ def render_macro_dashboard():
     c2.metric("Risk Regime", risk_label)
     c3.metric("Investment Timing View", timing_view)
 
-    st.dataframe(
-        score_df[["Indicator", "Category", "Latest", "1M %Chg", "Trend", "Risk Score", "Comment"]],
-        use_container_width=True,
-        hide_index=True,
-    )
+    if not score_df.empty:
+        st.dataframe(
+            score_df[["Indicator", "Category", "Latest", "1M %Chg", "Trend", "Risk Score", "Comment"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
-    fig = make_risk_bar_chart(score_df)
-    st.plotly_chart(fig, use_container_width=True)
+        fig = make_risk_bar_chart(score_df)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("Macro scorecard is empty.")
 
     with st.expander("Macro Interpretation"):
         st.markdown(
@@ -643,6 +744,7 @@ def render_detail_charts():
 
     for sid in selected_detail_series:
         df = fred_data.get(sid, pd.DataFrame())
+
         if df.empty:
             st.warning(f"{sid}: data not available.")
             continue
@@ -662,7 +764,7 @@ def render_detail_charts():
 
 
 # ============================================================
-# Dynamic module layout
+# Dynamic layout
 # ============================================================
 modules = []
 
@@ -681,15 +783,15 @@ for _, _, render_func in modules:
 
 
 # ============================================================
-# Footer notes
+# Footer
 # ============================================================
-with st.expander("Notes / Ideas for Next Upgrade"):
+with st.expander("Notes / Next Upgrade Ideas"):
     st.markdown(
         """
-- Add **ETF macro watchlist**: TLT / IEF / TIP / DBC / GLD / UUP
-- Add **asset allocation suggestion** based on macro regime
-- Add **alert thresholds** for USD/KRW, credit spread, and yield curve inversion
-- Add **drag-and-drop layout** using a custom component later
-- Add **session-state saved layout** per user preference
+- Add ETF macro watchlist: **TLT / IEF / TIP / DBC / GLD / UUP**
+- Add asset allocation suggestions based on macro regime
+- Add alert thresholds for **USD/KRW**, **credit spread**, and **yield curve inversion**
+- Add session-state saved layout per user preference
+- Add relative performance comparison across macro hedging ETFs
         """
     )
