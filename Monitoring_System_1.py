@@ -1,12 +1,12 @@
 # streamlit_app.py
 # ============================================================
 # Personal Financial View Dashboard
-# - Real-time refresh support
-# - View / Hide module toggle
-# - Flexible module positioning
-# - FX charts: USD/KRW, KRW/EUR
-# - FRED-based investment timing / risk analysis
-# - Safer time-column handling for yfinance output
+# - Tab 1: FX Monitoring
+# - Tab 2: FRED Macro Analysis
+# - Tab 3: FRED Detail Charts
+# - FX charts: USD/KRW, EUR/KRW
+# - Flexible period selection
+# - FRED section separated for easier expansion
 #
 # Run:
 #   streamlit run streamlit_app.py
@@ -45,7 +45,7 @@ st.set_page_config(
 )
 
 st.title("📊 Personal Financial View Dashboard")
-st.caption("Real-time FX monitoring + FRED-based macro risk and investment timing dashboard")
+st.caption("FX monitoring + tab-separated FRED macro analysis dashboard")
 
 
 # ============================================================
@@ -155,13 +155,7 @@ def momentum_label(value: Optional[float]) -> str:
 
 
 def normalize_time_column(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Makes the first time-like column consistently named as 'Time'.
-    Works for yfinance outputs where the index name may vary:
-    Date / Datetime / index / unnamed.
-    """
     out = df.copy().reset_index()
-
     possible_time_cols = ["Date", "Datetime", "date", "datetime", "index"]
 
     found = None
@@ -192,7 +186,7 @@ def download_fx_data(period: str = "2y", interval: str = "1d") -> Dict[str, pd.D
     """
     Yahoo Finance tickers:
     - USD/KRW = KRW=X
-    - EUR/KRW = EURKRW=X  -> KRW/EUR = 1 / (EUR/KRW)
+    - EUR/KRW = EURKRW=X
     """
     tickers = ["KRW=X", "EURKRW=X"]
 
@@ -212,34 +206,17 @@ def download_fx_data(period: str = "2y", interval: str = "1d") -> Dict[str, pd.D
     result: Dict[str, pd.DataFrame] = {}
 
     if isinstance(raw.columns, pd.MultiIndex):
-        # USD/KRW
         if "KRW=X" in raw.columns.get_level_values(0):
             fx1 = raw["KRW=X"].copy()
             fx1.columns = [str(c) for c in fx1.columns]
             fx1 = ensure_numeric_column(fx1, "Close")
             result["USDKRW"] = fx1
 
-        # EUR/KRW -> KRW/EUR
         if "EURKRW=X" in raw.columns.get_level_values(0):
             fx2 = raw["EURKRW=X"].copy()
             fx2.columns = [str(c) for c in fx2.columns]
             fx2 = ensure_numeric_column(fx2, "Close")
-            fx2["KRW_per_EUR"] = fx2["Close"]
-            fx2["EUR_per_KRW"] = np.where(
-                pd.notna(fx2["KRW_per_EUR"]) & (fx2["KRW_per_EUR"] != 0),
-                1.0 / fx2["KRW_per_EUR"],
-                np.nan,
-            )
-            result["KRWEUR"] = fx2
-    else:
-        # Fallback in case yfinance returns a single-level structure
-        cols = [str(c) for c in raw.columns]
-        raw.columns = cols
-
-        if "Close" in raw.columns:
-            fx1 = raw.copy()
-            fx1 = ensure_numeric_column(fx1, "Close")
-            result["USDKRW"] = fx1
+            result["EURKRW"] = fx2
 
     return result
 
@@ -306,17 +283,12 @@ def make_line_chart(
 
     if y_col not in data.columns:
         fig = go.Figure()
-        fig.update_layout(
-            title=f"{title} (No data column: {y_col})",
-            template="plotly_white",
-            height=420,
-        )
+        fig.update_layout(title=f"{title} (Missing column: {y_col})", template="plotly_white", height=420)
         return fig
 
     data[y_col] = pd.to_numeric(data[y_col], errors="coerce")
 
     fig = go.Figure()
-
     fig.add_trace(
         go.Scatter(
             x=data[x_col],
@@ -407,7 +379,7 @@ def make_risk_bar_chart(score_df: pd.DataFrame) -> go.Figure:
 
 
 # ============================================================
-# Macro risk logic
+# FRED macro logic
 # ============================================================
 def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object]:
     meta = FRED_SERIES[series_id]
@@ -426,7 +398,6 @@ def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object
 
     latest = float(s.iloc[-1])
     one_month_change = safe_pct_change(s, periods=min(1, len(s) - 1))
-
     recent_12 = s.iloc[-12:]
     q75 = recent_12.quantile(0.75)
 
@@ -527,7 +498,6 @@ def build_macro_scorecard(fred_data: Dict[str, pd.DataFrame]):
     score_df = pd.DataFrame(rows)
 
     label, icon = score_to_label(total_score)
-
     if total_score <= 2:
         timing_view = "Risk-on / constructive backdrop"
     elif total_score <= 4:
@@ -554,44 +524,36 @@ with st.sidebar:
         format_func=lambda x: f"{x} sec",
     )
 
-    period = st.selectbox(
+    fx_period = st.selectbox(
         "FX chart period",
-        options=["6mo", "1y", "2y", "5y"],
-        index=2,
+        options=["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y"],
+        index=4,
     )
 
-    st.subheader("View / Hide Modules")
-    show_fx = st.checkbox("Show FX Monitoring", value=True)
-    show_macro = st.checkbox("Show FRED Macro Dashboard", value=True)
-    show_detail = st.checkbox("Show Indicator Detail Charts", value=True)
-    show_debug = st.checkbox("Show Debug Info", value=False)
+    fx_interval = st.selectbox(
+        "FX chart interval",
+        options=["1d", "1wk", "1mo"],
+        index=0,
+    )
 
-    st.subheader("Module Positioning")
-    pos_fx = st.selectbox("Position - FX Monitoring", [1, 2, 3], index=0)
-    pos_macro = st.selectbox("Position - Macro Dashboard", [1, 2, 3], index=1)
-    pos_detail = st.selectbox("Position - Detail Charts", [1, 2, 3], index=2)
-
-    st.subheader("FRED Detail Options")
     selected_detail_series = st.multiselect(
-        "Indicators to display",
+        "FRED detail indicators",
         options=list(FRED_SERIES.keys()),
         default=["T10Y2Y", "BAMLH0A0HYM2", "UNRATE", "CPIAUCSL"],
         format_func=lambda x: FRED_SERIES[x]["name"],
     )
 
-    st.markdown("---")
-    st.caption("Tip: unique positions are recommended.")
+    show_debug = st.checkbox("Show Debug Info", value=False)
 
 
 # ============================================================
-# Refresh logic
+# Refresh
 # ============================================================
 if refresh_now:
     st.cache_data.clear()
     st.rerun()
 
 if auto_refresh:
-    st.caption(f"⏱️ Auto refresh enabled: every {refresh_interval} seconds")
     time.sleep(refresh_interval)
     st.cache_data.clear()
     st.rerun()
@@ -600,18 +562,17 @@ if auto_refresh:
 # ============================================================
 # Load data
 # ============================================================
-fx_data = download_fx_data(period=period)
+fx_data = download_fx_data(period=fx_period, interval=fx_interval)
 fred_data = load_all_fred_data() if FRED_API_KEY else {}
-last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-st.caption(f"Last updated: {last_update}")
+st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 # ============================================================
-# Module renderers
+# Render functions
 # ============================================================
-def render_fx_monitoring():
-    st.subheader("💱 Exchange Rate Monitoring")
+def render_fx_tab():
+    st.subheader("💱 FX Monitoring")
 
     col1, col2 = st.columns(2)
 
@@ -620,75 +581,49 @@ def render_fx_monitoring():
             df = normalize_time_column(fx_data["USDKRW"])
             df = ensure_numeric_column(df, "Close")
 
-            close_valid = df["Close"].dropna()
-            latest = close_valid.iloc[-1] if len(close_valid) else np.nan
-            prev = close_valid.iloc[-2] if len(close_valid) > 1 else np.nan
+            valid = df["Close"].dropna()
+            latest = valid.iloc[-1] if len(valid) else np.nan
+            prev = valid.iloc[-2] if len(valid) > 1 else np.nan
             delta = latest - prev if pd.notna(latest) and pd.notna(prev) else np.nan
 
-            st.metric(
-                "USD / KRW",
-                value=format_num(latest, 2),
-                delta=format_num(delta, 2) if pd.notna(delta) else "N/A",
+            st.metric("USD / KRW", format_num(latest, 2), format_num(delta, 2) if pd.notna(delta) else "N/A")
+            st.plotly_chart(
+                make_line_chart(df, "Time", "Close", "USD / KRW Exchange Rate", "KRW per USD", show_ma=True),
+                use_container_width=True,
             )
-
-            fig = make_line_chart(
-                df=df,
-                x_col="Time",
-                y_col="Close",
-                title="USD / KRW Exchange Rate",
-                y_title="KRW per USD",
-                show_ma=True,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            if show_debug:
-                with st.expander("Debug: USD/KRW"):
-                    st.write("Columns:", df.columns.tolist())
-                    st.dataframe(df.head(), use_container_width=True)
         else:
             st.warning("USD/KRW data not available.")
 
     with col2:
-        if "KRWEUR" in fx_data and not fx_data["KRWEUR"].empty:
-            df = normalize_time_column(fx_data["KRWEUR"])
-            df = ensure_numeric_column(df, "EUR_per_KRW")
+        if "EURKRW" in fx_data and not fx_data["EURKRW"].empty:
+            df = normalize_time_column(fx_data["EURKRW"])
+            df = ensure_numeric_column(df, "Close")
 
-            eur_valid = df["EUR_per_KRW"].dropna()
-            latest = eur_valid.iloc[-1] if len(eur_valid) else np.nan
-            prev = eur_valid.iloc[-2] if len(eur_valid) > 1 else np.nan
+            valid = df["Close"].dropna()
+            latest = valid.iloc[-1] if len(valid) else np.nan
+            prev = valid.iloc[-2] if len(valid) > 1 else np.nan
             delta = latest - prev if pd.notna(latest) and pd.notna(prev) else np.nan
 
-            st.metric(
-                "KRW / EUR",
-                value=f"{latest:.6f}" if pd.notna(latest) else "N/A",
-                delta=f"{delta:.6f}" if pd.notna(delta) else "N/A",
+            st.metric("EUR / KRW", format_num(latest, 2), format_num(delta, 2) if pd.notna(delta) else "N/A")
+            st.plotly_chart(
+                make_line_chart(df, "Time", "Close", "EUR / KRW Exchange Rate", "KRW per EUR", show_ma=True),
+                use_container_width=True,
             )
-
-            fig = make_line_chart(
-                df=df,
-                x_col="Time",
-                y_col="EUR_per_KRW",
-                title="KRW / EUR Exchange Rate",
-                y_title="EUR per KRW",
-                show_ma=True,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            if show_debug:
-                with st.expander("Debug: KRW/EUR"):
-                    st.write("Columns:", df.columns.tolist())
-                    st.dataframe(df.head(), use_container_width=True)
         else:
-            st.warning("KRW/EUR data not available.")
+            st.warning("EUR/KRW data not available.")
 
-    st.info(
-        "Interpretation: USD/KRW helps monitor KRW weakness vs USD. "
-        "KRW/EUR helps track Korean won purchasing power relative to EUR-based expenses and investments."
-    )
+    st.info("FX tab is focused on KRW exposure monitoring versus USD and EUR.")
+
+    if show_debug:
+        with st.expander("Debug Info"):
+            if "USDKRW" in fx_data:
+                st.write("USDKRW columns:", normalize_time_column(fx_data["USDKRW"]).columns.tolist())
+            if "EURKRW" in fx_data:
+                st.write("EURKRW columns:", normalize_time_column(fx_data["EURKRW"]).columns.tolist())
 
 
-def render_macro_dashboard():
-    st.subheader("🏦 FRED-Based Investment Timing / Risk Analysis")
+def render_fred_macro_tab():
+    st.subheader("🏦 FRED Macro Analysis")
 
     if not FRED_API_KEY:
         st.error("FRED_API_KEY not found. Please add your FRED API key.")
@@ -705,17 +640,14 @@ def render_macro_dashboard():
     c2.metric("Risk Regime", risk_label)
     c3.metric("Investment Timing View", timing_view)
 
-    if not score_df.empty:
-        st.dataframe(
-            score_df[["Indicator", "Category", "Latest", "1M %Chg", "Trend", "Risk Score", "Comment"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+    st.markdown("### Macro Scorecard")
+    st.dataframe(
+        score_df[["Indicator", "Category", "Latest", "1M %Chg", "Trend", "Risk Score", "Comment"]],
+        use_container_width=True,
+        hide_index=True,
+    )
 
-        fig = make_risk_bar_chart(score_df)
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("Macro scorecard is empty.")
+    st.plotly_chart(make_risk_bar_chart(score_df), use_container_width=True)
 
     with st.expander("Macro Interpretation"):
         st.markdown(
@@ -723,16 +655,20 @@ def render_macro_dashboard():
 **Current regime:** {risk_label}  
 **Investment timing view:** {timing_view}
 
-General interpretation:
-- **Low Risk:** Macro backdrop is relatively supportive. Risk assets can be favored selectively.
-- **Moderate Risk:** Mixed environment. Use balanced allocation and stronger position sizing discipline.
-- **High Risk:** Defensive posture preferred. Prioritize quality, duration balance, inflation hedges, and liquidity.
-            """
+This tab should be the place where your previous **FRED Macro Risk Dashboard** logic is merged.
+You can directly extend this section with:
+- liquidity block
+- rates block
+- credit block
+- inflation block
+- recession warning block
+- crisis probability summary
+"""
         )
 
 
-def render_detail_charts():
-    st.subheader("📈 FRED Indicator Detail Charts")
+def render_fred_detail_tab():
+    st.subheader("📈 FRED Detail Charts")
 
     if not FRED_API_KEY:
         st.error("FRED_API_KEY not found. Please add your FRED API key.")
@@ -744,7 +680,6 @@ def render_detail_charts():
 
     for sid in selected_detail_series:
         df = fred_data.get(sid, pd.DataFrame())
-
         if df.empty:
             st.warning(f"{sid}: data not available.")
             continue
@@ -759,39 +694,68 @@ def render_detail_charts():
         c2.metric("Change", format_num(delta, 2) if delta is not None else "N/A")
         c3.markdown(f"**Why it matters:** {meta['description']}")
 
-        fig = make_fred_chart(df, meta["name"])
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(make_fred_chart(df, meta["name"]), use_container_width=True)
 
 
 # ============================================================
-# Dynamic layout
+# Tabs
 # ============================================================
-modules = []
+tab1, tab2, tab3 = st.tabs(
+    ["💱 FX Monitoring", "🏦 FRED Macro Analysis", "📈 FRED Detail Charts"]
+)
 
-if show_fx:
-    modules.append((pos_fx, "FX Monitoring", render_fx_monitoring))
-if show_macro:
-    modules.append((pos_macro, "Macro Dashboard", render_macro_dashboard))
-if show_detail:
-    modules.append((pos_detail, "Detail Charts", render_detail_charts))
+with tab1:
+    render_fx_tab()
 
-modules = sorted(modules, key=lambda x: (x[0], x[1]))
+with tab2:
+    render_fred_macro_tab()
 
-for _, _, render_func in modules:
-    render_func()
-    st.markdown("---")
+with tab3:
+    render_fred_detail_tab()
 
 
 # ============================================================
 # Footer
 # ============================================================
-with st.expander("Notes / Next Upgrade Ideas"):
+with st.expander("Suggested Next Updates"):
     st.markdown(
         """
-- Add ETF macro watchlist: **TLT / IEF / TIP / DBC / GLD / UUP**
-- Add asset allocation suggestions based on macro regime
-- Add alert thresholds for **USD/KRW**, **credit spread**, and **yield curve inversion**
-- Add session-state saved layout per user preference
-- Add relative performance comparison across macro hedging ETFs
-        """
+### Recommended upgrades
+
+1. **Import your previous FRED dashboard blocks**
+   - Liquidity
+   - Rates
+   - Credit
+   - Inflation
+   - Recession warning
+
+2. **Add ETF reaction mapping**
+   - TLT / IEF / TIP / DBC / GLD / UUP
+   - Link macro regime to ETF behavior
+
+3. **Add signal summary cards**
+   - Risk-on
+   - Neutral
+   - Defensive
+   - Inflation hedge priority
+
+4. **Add alert system**
+   - USD/KRW threshold
+   - EUR/KRW threshold
+   - Yield curve inversion
+   - High yield spread spike
+
+5. **Add historical regime review**
+   - 2008
+   - 2020
+   - 2022 inflation shock
+   - compare current regime to past stress periods
+
+6. **Add portfolio implication section**
+   - Equity
+   - Bonds
+   - Gold
+   - Commodities
+   - Cash
+"""
     )
