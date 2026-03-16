@@ -1,1277 +1,1158 @@
 # streamlit_app.py
 # ============================================================
-# Personal Financial View Dashboard
-# - Tab 1: FX & Macro Market
-# - Tab 2: FRED Macro Analysis
-# - Tab 3: FRED Detail Charts
+# Global Market Overview Monitoring Dashboard
+# - Global snapshot
+# - FX (USD/KRW, EUR/KRW)
+# - Rates / Yield Curve
+# - Risk / Credit / Commodities
+# - Korea focus
 #
-# FX & Macro Market:
-# - Summary table first
-# - Charts below
-# - USD/KRW, EUR/KRW, EUR/USD, DXY (fallback)
-# - BTC/EUR, WTI, Brent, Gold, Silver, Natural Gas
-#
-# FRED Macro Analysis:
-# - Overview
-# - Liquidity
-# - Rates
-# - Credit
-# - Inflation
-# - Labor
-# - Recession
+# Install:
+#   pip install streamlit yfinance pandas numpy plotly requests
 #
 # Run:
 #   streamlit run streamlit_app.py
 #
-# Install:
-#   pip install streamlit pandas numpy plotly yfinance requests
-#
 # Optional:
-#   .streamlit/secrets.toml
-#   FRED_API_KEY="YOUR_FRED_API_KEY"
+#   Set FRED_API_KEY in environment variable
+#   or .streamlit/secrets.toml
+#   FRED_API_KEY="YOUR_API_KEY"
 # ============================================================
 
 from __future__ import annotations
 
 import os
-import time
-from datetime import datetime
-from typing import Dict, Optional, Tuple, List
+import math
+import requests
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import requests
+import plotly.express as px
 import streamlit as st
 import yfinance as yf
-
 
 # ============================================================
 # Page setup
 # ============================================================
 st.set_page_config(
-    page_title="Personal Financial View Dashboard",
-    page_icon="📊",
+    page_title="Global Market Overview Dashboard",
+    page_icon="🌍",
     layout="wide",
 )
 
-st.title("📊 Personal Financial View Dashboard")
-st.caption("FX monitoring + macro market assets + FRED macro risk dashboard")
-
+st.title("🌍 Global Market Overview Dashboard")
+st.caption(
+    "Integrated monitoring view for equities, FX, rates, risk, commodities, and Korea-specific macro signals"
+)
 
 # ============================================================
 # Config
 # ============================================================
-def get_fred_api_key() -> str:
-    key = os.getenv("FRED_API_KEY", "")
-    if key:
-        return key
+LOOKBACK_DAYS_DEFAULT = 730
+
+FRED_API_KEY = os.getenv("FRED_API_KEY", "")
+if not FRED_API_KEY:
     try:
-        if "FRED_API_KEY" in st.secrets:
-            return st.secrets["FRED_API_KEY"]
+        FRED_API_KEY = st.secrets.get("FRED_API_KEY", "")
     except Exception:
-        pass
-    return ""
+        FRED_API_KEY = ""
 
+# ============================================================
+# Sidebar
+# ============================================================
+st.sidebar.header("Settings")
 
-FRED_API_KEY = get_fred_api_key()
+lookback_days = st.sidebar.selectbox(
+    "Price history window",
+    options=[180, 365, 730, 1095],
+    index=2,
+)
 
+refresh = st.sidebar.button("🔄 Refresh Data")
+
+show_volume = st.sidebar.checkbox("Show volume where available", value=False)
+show_moving_avg = st.sidebar.checkbox("Show moving averages", value=True)
+show_drawdown = st.sidebar.checkbox("Show drawdown chart", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Optional FRED")
+st.sidebar.caption("Macro/credit data becomes richer if FRED_API_KEY is available.")
+if FRED_API_KEY:
+    st.sidebar.success("FRED API key detected")
+else:
+    st.sidebar.warning("No FRED API key found. Market sections still work.")
+
+# ============================================================
+# Universe
+# ============================================================
 MARKET_TICKERS = {
-    "USDKRW": {
-        "ticker": "KRW=X",
-        "label": "USD / KRW",
-        "y_title": "KRW per USD",
-        "interpretation": "Higher USD/KRW usually means KRW weakness and stronger USD pressure.",
-    },
-    "EURKRW": {
-        "ticker": "EURKRW=X",
-        "label": "EUR / KRW",
-        "y_title": "KRW per EUR",
-        "interpretation": "Higher EUR/KRW can raise Germany-based living cost burden in KRW terms.",
-    },
-    "EURUSD": {
-        "ticker": "EURUSD=X",
-        "label": "EUR / USD",
-        "y_title": "USD per EUR",
-        "interpretation": "EUR/USD tracks broad EUR versus USD strength.",
-    },
-    "DXY": {
-        "ticker": ["DX-Y.NYB", "DX=F", "UUP"],
-        "label": "US Dollar Index / Proxy",
-        "y_title": "Index / Proxy",
-        "interpretation": "A stronger dollar proxy often tightens global financial conditions.",
-    },
-    "BTCEUR": {
-        "ticker": "BTC-EUR",
-        "label": "BTC / EUR",
-        "y_title": "EUR per BTC",
-        "interpretation": "BTC/EUR can reflect liquidity and risk appetite.",
-    },
-    "WTI": {
-        "ticker": "CL=F",
-        "label": "WTI Oil",
-        "y_title": "USD",
-        "interpretation": "Rising oil can signal inflation and cost pressure.",
-    },
-    "BRENT": {
-        "ticker": "BZ=F",
-        "label": "Brent Oil",
-        "y_title": "USD",
-        "interpretation": "Brent is a key global oil benchmark and inflation-sensitive asset.",
-    },
-    "GOLD": {
-        "ticker": "GC=F",
-        "label": "Gold",
-        "y_title": "USD",
-        "interpretation": "Gold often benefits from uncertainty, lower real yields, or hedge demand.",
-    },
-    "SILVER": {
-        "ticker": "SI=F",
-        "label": "Silver",
-        "y_title": "USD",
-        "interpretation": "Silver mixes precious-metal behavior with industrial demand.",
-    },
-    "NATGAS": {
-        "ticker": "NG=F",
-        "label": "Natural Gas",
-        "y_title": "USD",
-        "interpretation": "Natural gas is important for energy-cost and industrial demand monitoring.",
-    },
+    "S&P 500": "^GSPC",
+    "Nasdaq 100": "^NDX",
+    "Dow Jones": "^DJI",
+    "Russell 2000": "^RUT",
+    "Euro Stoxx 50": "^STOXX50E",
+    "DAX": "^GDAXI",
+    "FTSE 100": "^FTSE",
+    "Nikkei 225": "^N225",
+    "Hang Seng": "^HSI",
+    "KOSPI": "^KS11",
+    "KOSDAQ": "^KQ11",
+    "SOX": "^SOX",
+    "US Dollar Index": "DX-Y.NYB",
+    "USD/KRW": "KRW=X",         # Yahoo convention: KRW=X = USDKRW
+    "EUR/KRW": "EURKRW=X",
+    "EUR/USD": "EURUSD=X",
+    "USD/JPY": "JPY=X",
+    "USD/CNY": "CNY=X",
+    "Gold": "GC=F",
+    "Silver": "SI=F",
+    "WTI": "CL=F",
+    "Brent": "BZ=F",
+    "Natural Gas": "NG=F",
+    "Copper": "HG=F",
+    "Bitcoin": "BTC-USD",
+    "TLT": "TLT",
+    "IEF": "IEF",
+    "TIP": "TIP",
+    "DBC": "DBC",
+    "GLD": "GLD",
+    "HYG": "HYG",
+    "LQD": "LQD",
+    "EEM": "EEM",
+    "EWY": "EWY",
+    "EWG": "EWG",
+    "FXE": "FXE",
+    "UUP": "UUP",
+    "VIX Proxy ETF": "VIXY",
 }
 
+# FRED series
 FRED_SERIES = {
-    "WALCL": {
-        "name": "Fed Total Assets",
-        "category": "Liquidity",
-        "description": "Fed balance sheet size. Rising assets often imply more liquidity support.",
-    },
-    "RRPONTSYD": {
-        "name": "Overnight Reverse Repo",
-        "category": "Liquidity",
-        "description": "High reverse repo usage can reflect excess money-market liquidity parking.",
-    },
-    "WTREGEN": {
-        "name": "Treasury General Account",
-        "category": "Liquidity",
-        "description": "TGA changes can drain or inject market liquidity depending on direction.",
-    },
-    "M2SL": {
-        "name": "M2 Money Supply",
-        "category": "Liquidity",
-        "description": "Money supply trend is a broad liquidity backdrop for risk assets.",
-    },
-    "FEDFUNDS": {
-        "name": "Fed Funds Rate",
-        "category": "Rates",
-        "description": "Higher policy rates reduce liquidity and increase financing costs.",
-    },
-    "DGS2": {
-        "name": "US 2Y Treasury Yield",
-        "category": "Rates",
-        "description": "Short-end rates reflect policy expectations and tightening pressure.",
-    },
-    "DGS10": {
-        "name": "US 10Y Treasury Yield",
-        "category": "Rates",
-        "description": "Long-end yields matter for valuation multiples and discount rates.",
-    },
-    "T10Y2Y": {
-        "name": "10Y - 2Y Treasury Spread",
-        "category": "Recession",
-        "description": "Yield curve inversion is a classic recession warning signal.",
-    },
-    "BAMLH0A0HYM2": {
-        "name": "High Yield OAS",
-        "category": "Credit",
-        "description": "Wider high-yield spreads suggest financial stress and risk aversion.",
-    },
-    "BAMLC0A0CM": {
-        "name": "US Corporate Master OAS",
-        "category": "Credit",
-        "description": "Corporate credit spread gauge for broad financing conditions.",
-    },
-    "CPIAUCSL": {
-        "name": "CPI (All Urban Consumers)",
-        "category": "Inflation",
-        "description": "Inflation pressure affects rates, real returns, and policy stance.",
-    },
-    "PCEPI": {
-        "name": "PCE Price Index",
-        "category": "Inflation",
-        "description": "PCE is a key Fed inflation gauge.",
-    },
-    "UNRATE": {
-        "name": "US Unemployment Rate",
-        "category": "Labor",
-        "description": "Rising unemployment can indicate weakening macro conditions.",
-    },
-    "PAYEMS": {
-        "name": "Nonfarm Payrolls",
-        "category": "Labor",
-        "description": "Payroll growth helps track labor momentum and economic resilience.",
-    },
-    "ICSA": {
-        "name": "Initial Jobless Claims",
-        "category": "Labor",
-        "description": "Jobless claims are a timely labor stress indicator.",
-    },
-    "USREC": {
-        "name": "US Recession Indicator",
-        "category": "Recession",
-        "description": "NBER recession indicator series.",
-    },
+    "US 2Y": "DGS2",
+    "US 10Y": "DGS10",
+    "US 30Y": "DGS30",
+    "US 3M": "DGS3MO",
+    "US Real 10Y": "DFII10",
+    "Fed Funds Rate": "FEDFUNDS",
+    "ECB Deposit Rate Proxy": "ECBDFR",
+    "Germany 10Y": "IRLTLT01DEM156N",
+    "Korea CPI YoY": "KORCPIALLMINMEI",
+    "US CPI YoY": "CPIAUCSL",
+    "US Core CPI": "CPILFESL",
+    "US HY OAS": "BAMLH0A0HYM2",
+    "US IG OAS": "BAMLC0A0CM",
+    "MOVE Proxy": "MOVEINDEX",   # may not always be available
+    "TED Spread": "TEDRATE",
+    "US Recession Prob Proxy": "RECPROUSM156N",
+    "Korea Exports YoY Proxy": "XTEXVA01KRM667S",
 }
-
-CATEGORY_ORDER = ["Liquidity", "Rates", "Credit", "Inflation", "Labor", "Recession"]
-
 
 # ============================================================
 # Helpers
 # ============================================================
-def safe_pct_change(series: pd.Series, periods: int = 1) -> Optional[float]:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) <= periods:
-        return None
-    prev = s.iloc[-1 - periods]
-    curr = s.iloc[-1]
-    if prev == 0 or pd.isna(prev) or pd.isna(curr):
-        return None
-    return (curr / prev - 1.0) * 100.0
-
-
-def latest_and_prev(series: pd.Series) -> Tuple[Optional[float], Optional[float]]:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < 2:
-        return None, None
-    return float(s.iloc[-1]), float(s.iloc[-2])
-
-
-def format_num(x: Optional[float], ndigits: int = 2) -> str:
-    if x is None or pd.isna(x):
-        return "N/A"
-    return f"{x:.{ndigits}f}"
-
-
-def format_pct(x: Optional[float], ndigits: int = 2) -> str:
-    if x is None or pd.isna(x):
-        return "N/A"
-    return f"{x:.{ndigits}f}%"
-
-
-def score_to_label(score: int) -> Tuple[str, str]:
-    if score <= 4:
-        return "Low Risk", "🟢"
-    if score <= 9:
-        return "Moderate Risk", "🟡"
-    return "High Risk", "🔴"
-
-
-def momentum_label(value: Optional[float]) -> str:
-    if value is None or pd.isna(value):
-        return "N/A"
-    if value > 0:
-        return "Improving"
-    if value < 0:
-        return "Deteriorating"
-    return "Flat"
-
-
-def normalize_time_column(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy().reset_index()
-    possible_time_cols = ["Date", "Datetime", "date", "datetime", "index"]
-
-    found = None
-    for col in possible_time_cols:
-        if col in out.columns:
-            found = col
-            break
-    if found is None:
-        found = out.columns[0]
-
-    out = out.rename(columns={found: "Time"})
-    return out
-
-
-def ensure_numeric_column(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    out = df.copy()
-    if col in out.columns:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    return out
-
-
-def calc_zscore(series: pd.Series, window: int = 60) -> Optional[float]:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < max(window, 20):
-        return None
-
-    recent = s.iloc[-window:]
-    mean_val = recent.mean()
-    std_val = recent.std()
-    if std_val == 0 or pd.isna(std_val):
-        return None
-
-    return float((recent.iloc[-1] - mean_val) / std_val)
-
-
-def calc_range_position(series: pd.Series, window: int = 252) -> Optional[float]:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < 2:
-        return None
-
-    window = min(window, len(s))
-    recent = s.iloc[-window:]
-    low_val = recent.min()
-    high_val = recent.max()
-    last_val = recent.iloc[-1]
-
-    if high_val == low_val:
-        return None
-
-    return float((last_val - low_val) / (high_val - low_val) * 100.0)
-
-
-def calc_drawdown_from_high(series: pd.Series, window: int = 252) -> Optional[float]:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) == 0:
-        return None
-
-    window = min(window, len(s))
-    recent = s.iloc[-window:]
-    high_val = recent.max()
-    last_val = recent.iloc[-1]
-    if high_val == 0:
-        return None
-
-    return float((last_val / high_val - 1.0) * 100.0)
-
-
-def get_period_days(period: str) -> int:
-    mapping = {
-        "1mo": 30,
-        "3mo": 90,
-        "6mo": 180,
-        "1y": 365,
-        "2y": 730,
-        "5y": 1825,
-        "10y": 3650,
-        "max": 5000,
-    }
-    return mapping.get(period, 365)
-
-
-def determine_series_freq(series_id: str) -> str:
-    weekly = {"WALCL", "RRPONTSYD", "ICSA"}
-    monthly = {"M2SL", "UNRATE", "PAYEMS", "CPIAUCSL", "PCEPI", "USREC"}
-    daily = {"FEDFUNDS", "DGS2", "DGS10", "T10Y2Y", "BAMLH0A0HYM2", "BAMLC0A0CM", "WTREGEN"}
-    if series_id in weekly:
-        return "weekly"
-    if series_id in monthly:
-        return "monthly"
-    if series_id in daily:
-        return "daily"
-    return "unknown"
-
-
-def compute_yoy_change(series: pd.Series, series_id: str) -> Optional[float]:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < 2:
-        return None
-    freq = determine_series_freq(series_id)
-    if freq == "monthly":
-        periods = min(12, len(s) - 1)
-    elif freq == "weekly":
-        periods = min(52, len(s) - 1)
-    else:
-        periods = min(252, len(s) - 1)
-    return safe_pct_change(s, periods=periods)
-
-
-def compute_short_change(series: pd.Series, series_id: str) -> Optional[float]:
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    if len(s) < 2:
-        return None
-    freq = determine_series_freq(series_id)
-    if freq == "monthly":
-        periods = min(1, len(s) - 1)
-    elif freq == "weekly":
-        periods = min(4, len(s) - 1)
-    else:
-        periods = min(21, len(s) - 1)
-    return safe_pct_change(s, periods=periods)
-
-
-# ============================================================
-# Data loading
-# ============================================================
-@st.cache_data(ttl=300, show_spinner=False)
-def download_market_data(period: str = "2y", interval: str = "1d") -> Dict[str, pd.DataFrame]:
-    all_download_tickers = []
-    for meta in MARKET_TICKERS.values():
-        tk = meta["ticker"]
-        if isinstance(tk, list):
-            all_download_tickers.extend(tk)
-        else:
-            all_download_tickers.append(tk)
-
-    all_download_tickers = list(dict.fromkeys(all_download_tickers))
-
+def safe_pct(a: float, b: float) -> float:
     try:
-        raw = yf.download(
-            tickers=all_download_tickers,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            group_by="ticker",
-            threads=True,
-        )
+        if b in [0, None] or pd.isna(a) or pd.isna(b):
+            return np.nan
+        return (a / b - 1.0) * 100.0
     except Exception:
-        return {}
+        return np.nan
 
-    result: Dict[str, pd.DataFrame] = {}
-    if not isinstance(raw.columns, pd.MultiIndex):
-        return result
 
-    level0 = raw.columns.get_level_values(0)
+def compute_drawdown(price: pd.Series) -> pd.Series:
+    if price.empty:
+        return price
+    running_max = price.cummax()
+    return (price / running_max - 1.0) * 100.0
 
-    for key, meta in MARKET_TICKERS.items():
-        ticker_candidates = meta["ticker"] if isinstance(meta["ticker"], list) else [meta["ticker"]]
-        selected_df = None
 
-        for tk in ticker_candidates:
-            if tk in level0:
-                df = raw[tk].copy()
-                df.columns = [str(c) for c in df.columns]
-                if "Close" in df.columns:
-                    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
-                    if df["Close"].dropna().shape[0] > 0:
-                        selected_df = df
-                        break
+def compute_zscore(series: pd.Series, window: int = 252) -> pd.Series:
+    mean_ = series.rolling(window).mean()
+    std_ = series.rolling(window).std()
+    return (series - mean_) / std_
 
-        if selected_df is not None:
-            result[key] = selected_df
 
-    return result
+def classify_regime(
+    vix_level: Optional[float],
+    usdkrw_chg_1m: Optional[float],
+    spx_chg_1m: Optional[float],
+    us10y_change_1m_bp: Optional[float],
+    wti_chg_1m: Optional[float],
+) -> str:
+    score = 0
+
+    if vix_level is not None and not pd.isna(vix_level):
+        if vix_level > 25:
+            score += 2
+        elif vix_level > 18:
+            score += 1
+
+    if usdkrw_chg_1m is not None and not pd.isna(usdkrw_chg_1m):
+        if usdkrw_chg_1m > 3:
+            score += 2
+        elif usdkrw_chg_1m > 1:
+            score += 1
+
+    if spx_chg_1m is not None and not pd.isna(spx_chg_1m):
+        if spx_chg_1m < -5:
+            score += 2
+        elif spx_chg_1m < -2:
+            score += 1
+
+    if us10y_change_1m_bp is not None and not pd.isna(us10y_change_1m_bp):
+        if us10y_change_1m_bp > 35:
+            score += 1
+
+    if wti_chg_1m is not None and not pd.isna(wti_chg_1m):
+        if wti_chg_1m > 8:
+            score += 1
+
+    if score >= 5:
+        return "🔴 Risk-off / Stress"
+    elif score >= 3:
+        return "🟠 Cautious / Inflation Pressure"
+    else:
+        return "🟢 Balanced / Risk-on"
+
+
+def get_status_text(value: float, warn: float, danger: float, reverse: bool = False) -> str:
+    if pd.isna(value):
+        return "N/A"
+    if not reverse:
+        if value >= danger:
+            return "🔴 High"
+        if value >= warn:
+            return "🟠 Moderate"
+        return "🟢 Normal"
+    else:
+        if value <= danger:
+            return "🔴 Weak"
+        if value <= warn:
+            return "🟠 Soft"
+        return "🟢 Strong"
+
+
+def format_number(x: float, digits: int = 2) -> str:
+    if x is None or pd.isna(x):
+        return "N/A"
+    if abs(x) >= 1000:
+        return f"{x:,.0f}"
+    return f"{x:,.{digits}f}"
+
+
+def format_pct(x: float, digits: int = 2) -> str:
+    if x is None or pd.isna(x):
+        return "N/A"
+    return f"{x:.{digits}f}%"
+
+
+def get_series_last_valid(s: pd.Series) -> float:
+    if s is None or s.empty:
+        return np.nan
+    s = s.dropna()
+    if s.empty:
+        return np.nan
+    return float(s.iloc[-1])
+
+
+def calc_change_windows(s: pd.Series) -> Dict[str, float]:
+    s = s.dropna()
+    if s.empty:
+        return {"1d": np.nan, "1w": np.nan, "1m": np.nan, "3m": np.nan, "1y": np.nan}
+    out = {}
+    n = len(s)
+    out["1d"] = safe_pct(s.iloc[-1], s.iloc[-2]) if n >= 2 else np.nan
+    out["1w"] = safe_pct(s.iloc[-1], s.iloc[-6]) if n >= 6 else np.nan
+    out["1m"] = safe_pct(s.iloc[-1], s.iloc[-22]) if n >= 22 else np.nan
+    out["3m"] = safe_pct(s.iloc[-1], s.iloc[-66]) if n >= 66 else np.nan
+    out["1y"] = safe_pct(s.iloc[-1], s.iloc[-252]) if n >= 252 else np.nan
+    return out
+
+
+def calc_percentile_position(s: pd.Series, window: int = 252) -> float:
+    s = s.dropna()
+    if len(s) < 20:
+        return np.nan
+    tail = s.iloc[-window:] if len(s) >= window else s
+    min_v = tail.min()
+    max_v = tail.max()
+    cur = tail.iloc[-1]
+    if max_v == min_v:
+        return 50.0
+    return (cur - min_v) / (max_v - min_v) * 100.0
+
+
+# ============================================================
+# Data loaders
+# ============================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yahoo_data(
+    tickers: Dict[str, str],
+    period_days: int = 730
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    end = datetime.today()
+    start = end - timedelta(days=period_days)
+
+    ticker_list = list(tickers.values())
+    df = yf.download(
+        ticker_list,
+        start=start.strftime("%Y-%m-%d"),
+        end=(end + timedelta(days=1)).strftime("%Y-%m-%d"),
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Normalize close
+    if isinstance(df.columns, pd.MultiIndex):
+        if "Close" in df.columns.get_level_values(0):
+            close = df["Close"].copy()
+        else:
+            close = pd.DataFrame()
+        if "Volume" in df.columns.get_level_values(0):
+            volume = df["Volume"].copy()
+        else:
+            volume = pd.DataFrame()
+    else:
+        close = pd.DataFrame(index=df.index)
+        volume = pd.DataFrame(index=df.index)
+        if "Close" in df.columns:
+            only_name = list(tickers.keys())[0]
+            close[only_name] = df["Close"]
+        if "Volume" in df.columns:
+            only_name = list(tickers.keys())[0]
+            volume[only_name] = df["Volume"]
+
+    # Rename symbol -> label
+    inverse_map = {v: k for k, v in tickers.items()}
+    close = close.rename(columns=inverse_map)
+    volume = volume.rename(columns=inverse_map)
+
+    # Keep requested order if present
+    close = close[[c for c in tickers.keys() if c in close.columns]]
+    volume = volume[[c for c in tickers.keys() if c in volume.columns]]
+
+    return close, volume
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fred_series(series_id: str, start_date: str = "2010-01-01") -> pd.DataFrame:
+def fetch_fred_series(series_id: str) -> pd.Series:
     if not FRED_API_KEY:
-        return pd.DataFrame(columns=["date", "value"])
+        return pd.Series(dtype=float)
 
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {
         "series_id": series_id,
         "api_key": FRED_API_KEY,
         "file_type": "json",
-        "observation_start": start_date,
+        "observation_start": (datetime.today() - timedelta(days=3650)).strftime("%Y-%m-%d"),
     }
 
     try:
         r = requests.get(url, params=params, timeout=20)
         r.raise_for_status()
-        data = r.json()
+        js = r.json()
+        obs = js.get("observations", [])
+        if not obs:
+            return pd.Series(dtype=float)
+
+        df = pd.DataFrame(obs)
+        df["date"] = pd.to_datetime(df["date"])
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        s = pd.Series(df["value"].values, index=df["date"])
+        s = s.sort_index()
+        return s
     except Exception:
-        return pd.DataFrame(columns=["date", "value"])
-
-    if "observations" not in data:
-        return pd.DataFrame(columns=["date", "value"])
-
-    df = pd.DataFrame(data["observations"])
-    if df.empty:
-        return pd.DataFrame(columns=["date", "value"])
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df = df[["date", "value"]].dropna().sort_values("date").reset_index(drop=True)
-    return df
+        return pd.Series(dtype=float)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_all_fred_data() -> Dict[str, pd.DataFrame]:
-    return {sid: fetch_fred_series(sid) for sid in FRED_SERIES.keys()}
+def load_fred_bundle(series_map: Dict[str, str]) -> Dict[str, pd.Series]:
+    out = {}
+    for name, sid in series_map.items():
+        out[name] = fetch_fred_series(sid)
+    return out
 
+
+def build_yield_curve_df(fred_data: Dict[str, pd.Series]) -> pd.DataFrame:
+    curve_labels = ["US 3M", "US 2Y", "US 10Y", "US 30Y"]
+    maturity_years = [0.25, 2, 10, 30]
+    values = []
+    for lbl in curve_labels:
+        values.append(get_series_last_valid(fred_data.get(lbl, pd.Series(dtype=float))))
+    return pd.DataFrame({
+        "Maturity": maturity_years,
+        "Label": curve_labels,
+        "Yield": values,
+    })
+
+
+# ============================================================
+# Refresh hook
+# ============================================================
+if refresh:
+    st.cache_data.clear()
+
+# ============================================================
+# Load data
+# ============================================================
+with st.spinner("Loading market data..."):
+    close_df, volume_df = fetch_yahoo_data(MARKET_TICKERS, period_days=lookback_days)
+    fred_data = load_fred_bundle(FRED_SERIES) if FRED_API_KEY else {}
+
+if close_df.empty:
+    st.error("Failed to load Yahoo Finance data. Please retry.")
+    st.stop()
+
+# ============================================================
+# Derived data
+# ============================================================
+norm_df = close_df / close_df.iloc[0] * 100.0
+drawdown_df = close_df.apply(compute_drawdown)
+
+ma20 = close_df.rolling(20).mean()
+ma50 = close_df.rolling(50).mean()
+ma200 = close_df.rolling(200).mean()
+
+zscore_1y = close_df.apply(lambda s: compute_zscore(s, window=252))
+
+snapshot_rows = []
+for asset in close_df.columns:
+    s = close_df[asset].dropna()
+    if s.empty:
+        continue
+
+    chg = calc_change_windows(s)
+    snapshot_rows.append({
+        "Asset": asset,
+        "Last": s.iloc[-1],
+        "1D %": chg["1d"],
+        "1W %": chg["1w"],
+        "1M %": chg["1m"],
+        "3M %": chg["3m"],
+        "1Y %": chg["1y"],
+        "52W Position %": calc_percentile_position(s, window=252),
+        "Drawdown %": compute_drawdown(s).iloc[-1],
+        "Z-score 1Y": zscore_1y[asset].dropna().iloc[-1] if not zscore_1y[asset].dropna().empty else np.nan,
+    })
+
+snapshot_df = pd.DataFrame(snapshot_rows)
+
+# FX quick metrics
+usdkrw = close_df["USD/KRW"].dropna() if "USD/KRW" in close_df.columns else pd.Series(dtype=float)
+eurkrw = close_df["EUR/KRW"].dropna() if "EUR/KRW" in close_df.columns else pd.Series(dtype=float)
+eurusd = close_df["EUR/USD"].dropna() if "EUR/USD" in close_df.columns else pd.Series(dtype=float)
+dxy = close_df["US Dollar Index"].dropna() if "US Dollar Index" in close_df.columns else pd.Series(dtype=float)
+spx = close_df["S&P 500"].dropna() if "S&P 500" in close_df.columns else pd.Series(dtype=float)
+wti = close_df["WTI"].dropna() if "WTI" in close_df.columns else pd.Series(dtype=float)
+
+usdkrw_1m = calc_change_windows(usdkrw).get("1m", np.nan) if not usdkrw.empty else np.nan
+spx_1m = calc_change_windows(spx).get("1m", np.nan) if not spx.empty else np.nan
+wti_1m = calc_change_windows(wti).get("1m", np.nan) if not wti.empty else np.nan
+
+us10y = fred_data.get("US 10Y", pd.Series(dtype=float)).dropna() if fred_data else pd.Series(dtype=float)
+us10y_change_1m_bp = np.nan
+if not us10y.empty and len(us10y) >= 22:
+    us10y_change_1m_bp = (us10y.iloc[-1] - us10y.iloc[-22]) * 100
+
+vix_level = get_series_last_valid(close_df["VIX Proxy ETF"]) if "VIX Proxy ETF" in close_df.columns else np.nan
+# Better proxy from actual VIX if available through Yahoo:
+if "^VIX" not in MARKET_TICKERS.values():
+    try:
+        vix_raw = yf.download("^VIX", period="2y", auto_adjust=True, progress=False)
+        if not vix_raw.empty and "Close" in vix_raw.columns:
+            vix_level = float(vix_raw["Close"].dropna().iloc[-1])
+    except Exception:
+        pass
+
+regime = classify_regime(vix_level, usdkrw_1m, spx_1m, us10y_change_1m_bp, wti_1m)
 
 # ============================================================
 # Chart functions
 # ============================================================
 def make_line_chart(
     df: pd.DataFrame,
-    x_col: str,
-    y_col: str,
     title: str,
-    y_title: str,
-    show_ma: bool = True,
+    yaxis_title: str = "",
+    height: int = 430,
 ) -> go.Figure:
-    data = df.copy()
-
-    if x_col not in data.columns:
-        fallback_cols = ["Time", "Date", "Datetime", "date", "datetime", "index"]
-        found = None
-        for col in fallback_cols:
-            if col in data.columns:
-                found = col
-                break
-        x_col = found if found is not None else data.columns[0]
-
-    if y_col not in data.columns:
-        fig = go.Figure()
-        fig.update_layout(
-            title=f"{title} (Missing column: {y_col})",
-            template="plotly_white",
-            height=380,
-        )
-        return fig
-
-    data[y_col] = pd.to_numeric(data[y_col], errors="coerce")
-
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=data[x_col],
-            y=data[y_col],
+    for col in df.columns:
+        if df[col].dropna().empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=df[col],
             mode="lines",
-            name=y_title,
-            line=dict(width=2),
-        )
-    )
-
-    if show_ma and len(data) >= 50:
-        data["MA50"] = data[y_col].rolling(50).mean()
-        data["MA200"] = data[y_col].rolling(200).mean()
-
-        fig.add_trace(
-            go.Scatter(
-                x=data[x_col],
-                y=data["MA50"],
-                mode="lines",
-                name="MA50",
-                line=dict(width=1.5, dash="dot"),
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=data[x_col],
-                y=data["MA200"],
-                mode="lines",
-                name="MA200",
-                line=dict(width=1.5, dash="dash"),
-            )
-        )
-
+            name=col,
+        ))
     fig.update_layout(
         title=title,
-        xaxis_title="Date",
-        yaxis_title=y_title,
+        height=height,
         template="plotly_white",
-        height=380,
-        hovermode="x unified",
-        legend=dict(orientation="h", y=1.08, x=0),
-        margin=dict(l=30, r=30, t=60, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=40, r=20, t=70, b=40),
+        yaxis_title=yaxis_title,
     )
     return fig
 
 
-def make_fred_chart(df: pd.DataFrame, title: str) -> go.Figure:
+def make_single_price_chart(
+    price: pd.Series,
+    name: str,
+    volume: Optional[pd.Series] = None,
+    show_ma: bool = True,
+    height: int = 430,
+) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=df["date"],
-            y=df["value"],
-            mode="lines",
-            name=title,
-            line=dict(width=2),
-        )
-    )
+
+    fig.add_trace(go.Scatter(
+        x=price.index,
+        y=price.values,
+        mode="lines",
+        name=name,
+    ))
+
+    if show_ma:
+        ma20_s = price.rolling(20).mean()
+        ma50_s = price.rolling(50).mean()
+        ma200_s = price.rolling(200).mean()
+        fig.add_trace(go.Scatter(x=price.index, y=ma20_s, mode="lines", name="MA20"))
+        fig.add_trace(go.Scatter(x=price.index, y=ma50_s, mode="lines", name="MA50"))
+        fig.add_trace(go.Scatter(x=price.index, y=ma200_s, mode="lines", name="MA200"))
+
     fig.update_layout(
-        title=title,
-        xaxis_title="Date",
-        yaxis_title="Value",
+        title=f"{name} Price Trend",
+        height=height,
         template="plotly_white",
-        height=360,
-        hovermode="x unified",
-        margin=dict(l=30, r=30, t=60, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=40, r=20, t=70, b=40),
     )
     return fig
 
 
-def make_risk_bar_chart(score_df: pd.DataFrame) -> go.Figure:
-    fig = go.Figure(
-        go.Bar(
-            x=score_df["Indicator"],
-            y=score_df["Risk Score"],
-            text=score_df["Risk Score"],
-            textposition="outside",
-        )
+def make_drawdown_chart(price: pd.Series, name: str, height: int = 320) -> go.Figure:
+    dd = compute_drawdown(price)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dd.index,
+        y=dd.values,
+        mode="lines",
+        name=f"{name} Drawdown",
+        fill="tozeroy",
+    ))
+    fig.update_layout(
+        title=f"{name} Drawdown vs Previous Peak",
+        height=height,
+        template="plotly_white",
+        margin=dict(l=40, r=20, t=70, b=40),
+        yaxis_title="Drawdown (%)",
+    )
+    return fig
+
+
+def make_heatmap(df: pd.DataFrame, title: str, height: int = 420) -> go.Figure:
+    plot_df = df.copy()
+    fig = px.imshow(
+        plot_df,
+        aspect="auto",
+        title=title,
+        text_auto=".1f",
     )
     fig.update_layout(
-        title="Macro Risk Score by Indicator",
-        xaxis_title="Indicator",
-        yaxis_title="Risk Score (0-2)",
+        height=height,
         template="plotly_white",
+        margin=dict(l=40, r=20, t=70, b=40),
+    )
+    return fig
+
+
+def make_yield_curve_chart(curve_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=curve_df["Maturity"],
+        y=curve_df["Yield"],
+        mode="lines+markers+text",
+        text=[f"{v:.2f}%" if not pd.isna(v) else "N/A" for v in curve_df["Yield"]],
+        textposition="top center",
+        name="US Curve",
+    ))
+    fig.update_layout(
+        title="US Yield Curve",
+        xaxis_title="Maturity (Years)",
+        yaxis_title="Yield (%)",
         height=420,
-        margin=dict(l=30, r=30, t=60, b=60),
-    )
-    return fig
-
-
-def make_category_bar_chart(df: pd.DataFrame) -> go.Figure:
-    if df.empty:
-        fig = go.Figure()
-        fig.update_layout(template="plotly_white", height=320, title="No category data")
-        return fig
-
-    grouped = (
-        df.groupby("Category", as_index=False)["Risk Score"]
-        .mean()
-        .sort_values("Risk Score", ascending=False)
-    )
-
-    fig = go.Figure(
-        go.Bar(
-            x=grouped["Category"],
-            y=grouped["Risk Score"],
-            text=np.round(grouped["Risk Score"], 2),
-            textposition="outside",
-        )
-    )
-    fig.update_layout(
-        title="Category Risk Score",
-        xaxis_title="Category",
-        yaxis_title="Average Risk Score",
         template="plotly_white",
-        height=360,
-        margin=dict(l=30, r=30, t=60, b=30),
+        margin=dict(l=40, r=20, t=70, b=40),
+    )
+    return fig
+
+
+def make_dual_axis_chart(
+    left_series: pd.Series,
+    right_series: pd.Series,
+    left_name: str,
+    right_name: str,
+    title: str,
+    height: int = 430,
+) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=left_series.index,
+        y=left_series.values,
+        mode="lines",
+        name=left_name,
+        yaxis="y1",
+    ))
+    fig.add_trace(go.Scatter(
+        x=right_series.index,
+        y=right_series.values,
+        mode="lines",
+        name=right_name,
+        yaxis="y2",
+    ))
+    fig.update_layout(
+        title=title,
+        template="plotly_white",
+        height=height,
+        margin=dict(l=40, r=20, t=70, b=40),
+        yaxis=dict(title=left_name),
+        yaxis2=dict(title=right_name, overlaying="y", side="right"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     )
     return fig
 
 
 # ============================================================
-# FRED logic
+# Header summary
 # ============================================================
-def compute_indicator_risk(series_id: str, df: pd.DataFrame) -> Dict[str, object]:
-    meta = FRED_SERIES[series_id]
-    s = pd.to_numeric(df["value"], errors="coerce").dropna()
-
-    if len(s) < 12:
-        return {
-            "Series ID": series_id,
-            "Indicator": meta["name"],
-            "Category": meta["category"],
-            "Latest": np.nan,
-            "Short %Chg": np.nan,
-            "YoY %Chg": np.nan,
-            "Trend": "N/A",
-            "Risk Score": 0,
-            "Comment": "Not enough data",
-        }
-
-    latest = float(s.iloc[-1])
-    short_change = compute_short_change(s, series_id)
-    yoy_change = compute_yoy_change(s, series_id)
-
-    recent_window = s.iloc[-min(len(s), 24):]
-    q25 = recent_window.quantile(0.25)
-    q75 = recent_window.quantile(0.75)
-    med = recent_window.median()
-
-    risk_score = 0
-    comment = meta["description"]
-
-    if series_id == "T10Y2Y":
-        if latest < 0:
-            risk_score = 2
-        elif latest < 0.5:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = "Yield curve inversion increases recession risk." if latest < 0 else "Yield curve remains positive."
-
-    elif series_id == "BAMLH0A0HYM2":
-        if latest > 5.0:
-            risk_score = 2
-        elif latest > 4.0:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = "Wider HY spread indicates rising credit stress."
-
-    elif series_id == "BAMLC0A0CM":
-        if latest > 3.5:
-            risk_score = 2
-        elif latest > 2.5:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = "Broader corporate credit stress gauge."
-
-    elif series_id == "UNRATE":
-        if latest > q75:
-            risk_score = 2
-        elif latest > med:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = "Rising unemployment suggests macro weakening."
-
-    elif series_id == "ICSA":
-        if latest > q75:
-            risk_score = 2
-        elif latest > med:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = "Higher jobless claims can warn of labor stress."
-
-    elif series_id == "CPIAUCSL":
-        yoy = 0 if yoy_change is None else yoy_change
-        if yoy > 4.0:
-            risk_score = 2
-        elif yoy > 2.5:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = f"CPI inflation YoY: {format_num(yoy)}%."
-
-    elif series_id == "PCEPI":
-        yoy = 0 if yoy_change is None else yoy_change
-        if yoy > 3.5:
-            risk_score = 2
-        elif yoy > 2.3:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = f"PCE inflation YoY: {format_num(yoy)}%."
-
-    elif series_id == "FEDFUNDS":
-        if latest > q75:
-            risk_score = 2
-        elif latest > med:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = "Higher policy rates reduce liquidity."
-
-    elif series_id == "DGS10":
-        if latest > q75:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = "Higher long yields can compress valuation multiples."
-
-    elif series_id == "DGS2":
-        if latest > q75:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = "Higher short yields reflect tighter policy expectations."
-
-    elif series_id == "M2SL":
-        yoy = 0 if yoy_change is None else yoy_change
-        if yoy < 0:
-            risk_score = 2
-        elif yoy < 3.0:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = f"M2 YoY liquidity backdrop: {format_num(yoy)}%."
-
-    elif series_id == "WALCL":
-        short = 0 if short_change is None else short_change
-        if short < -2.0:
-            risk_score = 2
-        elif short < 0:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = f"Fed balance sheet short-term change: {format_num(short)}%."
-
-    elif series_id == "RRPONTSYD":
-        short = 0 if short_change is None else short_change
-        if latest > q75 and short > 0:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = "Elevated reverse repo can reflect excess liquidity parking."
-
-    elif series_id == "WTREGEN":
-        short = 0 if short_change is None else short_change
-        if short > 10:
-            risk_score = 1
-            comment = "Rising TGA can drain liquidity from markets."
-        else:
-            risk_score = 0
-            comment = "TGA not showing material liquidity drain."
-
-    elif series_id == "PAYEMS":
-        yoy = 0 if yoy_change is None else yoy_change
-        if yoy < 0:
-            risk_score = 2
-        elif yoy < 1.0:
-            risk_score = 1
-        else:
-            risk_score = 0
-        comment = f"Payroll growth YoY: {format_num(yoy)}%."
-
-    elif series_id == "USREC":
-        risk_score = 2 if latest >= 1 else 0
-        comment = "Official recession indicator."
-
-    return {
-        "Series ID": series_id,
-        "Indicator": meta["name"],
-        "Category": meta["category"],
-        "Latest": latest,
-        "Short %Chg": short_change,
-        "YoY %Chg": yoy_change,
-        "Trend": momentum_label(short_change),
-        "Risk Score": risk_score,
-        "Comment": comment,
-    }
-
-
-def build_macro_scorecard(fred_data: Dict[str, pd.DataFrame]):
-    rows = []
-    total_score = 0
-
-    for sid, df in fred_data.items():
-        if df.empty:
-            continue
-        row = compute_indicator_risk(sid, df)
-        rows.append(row)
-        total_score += int(row["Risk Score"])
-
-    score_df = pd.DataFrame(rows)
-
-    label, icon = score_to_label(total_score)
-    if total_score <= 4:
-        timing_view = "Risk-on / constructive backdrop"
-    elif total_score <= 9:
-        timing_view = "Balanced / selective allocation"
-    else:
-        timing_view = "Defensive / risk management priority"
-
-    return score_df, total_score, label, f"{icon} {timing_view}"
-
-
-def filter_category(score_df: pd.DataFrame, category: str) -> pd.DataFrame:
-    if score_df.empty:
-        return pd.DataFrame()
-    return score_df[score_df["Category"] == category].copy()
-
-
-# ============================================================
-# Market summary helpers
-# ============================================================
-def build_market_summary_table(data_dict: Dict[str, pd.DataFrame], keys: List[str], period_label: str) -> pd.DataFrame:
-    rows = []
-    period_days = get_period_days(period_label)
-
-    for key in keys:
-        meta = MARKET_TICKERS[key]
-
-        if key not in data_dict or data_dict[key].empty:
-            rows.append({
-                "Asset": meta["label"],
-                "Latest": np.nan,
-                "1-Step %": np.nan,
-                "Z-score(60)": np.nan,
-                "Range Pos(52W)": np.nan,
-                "From High": np.nan,
-                "Interpretation": "Data not available",
-            })
-            continue
-
-        df = normalize_time_column(data_dict[key])
-        df = ensure_numeric_column(df, "Close")
-        valid = df["Close"].dropna()
-
-        if len(valid) == 0:
-            rows.append({
-                "Asset": meta["label"],
-                "Latest": np.nan,
-                "1-Step %": np.nan,
-                "Z-score(60)": np.nan,
-                "Range Pos(52W)": np.nan,
-                "From High": np.nan,
-                "Interpretation": "No valid close data",
-            })
-            continue
-
-        latest = valid.iloc[-1]
-        prev = valid.iloc[-2] if len(valid) > 1 else np.nan
-        delta_pct = (latest / prev - 1.0) * 100.0 if pd.notna(prev) and prev != 0 else np.nan
-
-        z60 = calc_zscore(valid, window=60)
-        range_pos = calc_range_position(valid, window=min(252, period_days))
-        dd_high = calc_drawdown_from_high(valid, window=min(252, period_days))
-
-        rows.append({
-            "Asset": meta["label"],
-            "Latest": round(float(latest), 2) if pd.notna(latest) else np.nan,
-            "1-Step %": round(float(delta_pct), 2) if pd.notna(delta_pct) else np.nan,
-            "Z-score(60)": round(float(z60), 2) if z60 is not None else np.nan,
-            "Range Pos(52W)": round(float(range_pos), 1) if range_pos is not None else np.nan,
-            "From High": round(float(dd_high), 1) if dd_high is not None else np.nan,
-            "Interpretation": meta["interpretation"],
-        })
-
-    return pd.DataFrame(rows)
-
-
-def render_market_chart(data_dict: Dict[str, pd.DataFrame], key: str, show_debug: bool):
-    meta = MARKET_TICKERS[key]
-
-    if key not in data_dict or data_dict[key].empty:
-        st.warning(f"{meta['label']} data not available.")
-        return
-
-    df = normalize_time_column(data_dict[key])
-    df = ensure_numeric_column(df, "Close")
-
-    st.markdown(f"### {meta['label']}")
-    fig = make_line_chart(
-        df=df,
-        x_col="Time",
-        y_col="Close",
-        title=meta["label"],
-        y_title=meta["y_title"],
-        show_ma=True,
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    if show_debug:
-        with st.expander(f"Debug: {meta['label']}"):
-            st.write("Ticker source:", meta["ticker"])
-            st.write("Columns:", df.columns.tolist())
-            st.write("Valid close count:", int(df["Close"].dropna().shape[0]) if "Close" in df.columns else 0)
-            st.dataframe(df.head(), use_container_width=True)
-
-
-# ============================================================
-# Sidebar
-# ============================================================
-with st.sidebar:
-    st.header("⚙️ Controls")
-
-    refresh_now = st.button("🔄 Refresh Data", use_container_width=True)
-
-    auto_refresh = st.checkbox("Enable auto refresh", value=False)
-    refresh_interval = st.selectbox(
-        "Refresh interval",
-        options=[30, 60, 120, 300],
-        index=1,
-        format_func=lambda x: f"{x} sec",
-    )
-
-    market_period = st.selectbox(
-        "Market chart period",
-        options=["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"],
-        index=4,
-    )
-
-    market_interval = st.selectbox(
-        "Market chart interval",
-        options=["1d", "1wk", "1mo"],
-        index=0,
-    )
-
-    fred_start_date = st.selectbox(
-        "FRED start date",
-        options=["2000-01-01", "2008-01-01", "2010-01-01", "2015-01-01", "2020-01-01"],
-        index=2,
-    )
-
-    selected_detail_series = st.multiselect(
-        "FRED detail indicators",
-        options=list(FRED_SERIES.keys()),
-        default=["T10Y2Y", "BAMLH0A0HYM2", "UNRATE", "CPIAUCSL"],
-        format_func=lambda x: FRED_SERIES[x]["name"],
-    )
-
-    show_debug = st.checkbox("Show Debug Info", value=False)
-
-
-# ============================================================
-# Refresh
-# ============================================================
-if refresh_now:
-    st.cache_data.clear()
-    st.rerun()
-
-if auto_refresh:
-    time.sleep(refresh_interval)
-    st.cache_data.clear()
-    st.rerun()
-
-
-# ============================================================
-# Reload helper for start date
-# ============================================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_all_fred_data_with_start(start_date: str) -> Dict[str, pd.DataFrame]:
-    return {sid: fetch_fred_series(sid, start_date=start_date) for sid in FRED_SERIES.keys()}
-
-
-# ============================================================
-# Load data
-# ============================================================
-market_data = download_market_data(period=market_period, interval=market_interval)
-fred_data = load_all_fred_data_with_start(fred_start_date) if FRED_API_KEY else {}
-
-st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-
-# ============================================================
-# Render functions
-# ============================================================
-def render_market_tab():
-    st.subheader("💱 FX & Macro Market Monitoring")
-
-    sub_fx, sub_macro = st.tabs(["FX", "Macro Assets"])
-
-    with sub_fx:
-        fx_keys = ["USDKRW", "EURKRW", "EURUSD", "DXY"]
-
-        st.markdown("### FX Summary")
-        fx_summary = build_market_summary_table(market_data, fx_keys, market_period)
-        st.dataframe(
-            fx_summary[["Asset", "Latest", "1-Step %", "Z-score(60)", "Range Pos(52W)", "From High"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        with st.expander("FX Interpretation"):
-            st.dataframe(
-                fx_summary[["Asset", "Interpretation"]],
-                use_container_width=True,
-                hide_index=True,
+st.subheader("Market Regime")
+st.info(regime)
+
+top_assets = [
+    "S&P 500", "Nasdaq 100", "Euro Stoxx 50", "KOSPI",
+    "USD/KRW", "EUR/KRW", "US Dollar Index", "WTI", "Gold", "Bitcoin"
+]
+
+metric_cols = st.columns(len(top_assets))
+for i, asset in enumerate(top_assets):
+    if asset in close_df.columns:
+        s = close_df[asset].dropna()
+        if not s.empty:
+            chg1d = calc_change_windows(s)["1d"]
+            metric_cols[i].metric(
+                asset,
+                format_number(s.iloc[-1], 2),
+                format_pct(chg1d, 2)
             )
-
-        st.markdown("### FX Charts")
-        col1, col2 = st.columns(2)
-        with col1:
-            render_market_chart(market_data, "USDKRW", show_debug)
-            render_market_chart(market_data, "EURUSD", show_debug)
-        with col2:
-            render_market_chart(market_data, "EURKRW", show_debug)
-            render_market_chart(market_data, "DXY", show_debug)
-
-    with sub_macro:
-        macro_keys = ["BTCEUR", "WTI", "BRENT", "GOLD", "SILVER", "NATGAS"]
-
-        st.markdown("### Macro Asset Summary")
-        macro_summary = build_market_summary_table(market_data, macro_keys, market_period)
-        st.dataframe(
-            macro_summary[["Asset", "Latest", "1-Step %", "Z-score(60)", "Range Pos(52W)", "From High"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        with st.expander("Macro Asset Interpretation"):
-            st.dataframe(
-                macro_summary[["Asset", "Interpretation"]],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        st.markdown("### Macro Asset Charts")
-        col1, col2 = st.columns(2)
-        with col1:
-            render_market_chart(market_data, "BTCEUR", show_debug)
-            render_market_chart(market_data, "WTI", show_debug)
-            render_market_chart(market_data, "GOLD", show_debug)
-        with col2:
-            render_market_chart(market_data, "BRENT", show_debug)
-            render_market_chart(market_data, "SILVER", show_debug)
-            render_market_chart(market_data, "NATGAS", show_debug)
-
-
-def render_fred_category_section(score_df: pd.DataFrame, fred_data: Dict[str, pd.DataFrame], category: str):
-    cat_df = filter_category(score_df, category)
-    st.markdown(f"### {category} Snapshot")
-
-    if cat_df.empty:
-        st.info(f"No {category} data available.")
-        return
-
-    st.dataframe(
-        cat_df[["Indicator", "Latest", "Short %Chg", "YoY %Chg", "Trend", "Risk Score", "Comment"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    series_ids = cat_df["Series ID"].tolist()
-    cols = st.columns(2)
-    for idx, sid in enumerate(series_ids):
-        with cols[idx % 2]:
-            df = fred_data.get(sid, pd.DataFrame())
-            if not df.empty:
-                st.plotly_chart(make_fred_chart(df, FRED_SERIES[sid]["name"]), use_container_width=True)
-
-
-def render_fred_macro_tab():
-    st.subheader("🏦 FRED Macro Analysis")
-
-    if not FRED_API_KEY:
-        st.error("FRED_API_KEY not found. Please add your FRED API key.")
-        return
-
-    if not fred_data:
-        st.warning("No FRED data available.")
-        return
-
-    score_df, total_score, risk_label, timing_view = build_macro_scorecard(fred_data)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Macro Risk Score", total_score)
-    c2.metric("Risk Regime", risk_label)
-    c3.metric("Investment Timing View", timing_view)
-
-    sub_tabs = st.tabs(["Overview", "Liquidity", "Rates", "Credit", "Inflation", "Labor", "Recession"])
-
-    with sub_tabs[0]:
-        st.markdown("### Macro Scorecard")
-        st.dataframe(
-            score_df[["Category", "Indicator", "Latest", "Short %Chg", "YoY %Chg", "Trend", "Risk Score", "Comment"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.plotly_chart(make_risk_bar_chart(score_df), use_container_width=True)
-        with col_b:
-            st.plotly_chart(make_category_bar_chart(score_df), use_container_width=True)
-
-        category_scores = (
-            score_df.groupby("Category", as_index=False)["Risk Score"]
-            .mean()
-            .sort_values("Category")
-        )
-        st.markdown("### Category Summary")
-        st.dataframe(category_scores, use_container_width=True, hide_index=True)
-
-        with st.expander("Macro Interpretation"):
-            st.markdown(
-                f"""
-**Current regime:** {risk_label}  
-**Investment timing view:** {timing_view}
-
-Interpretation guide:
-- **Liquidity:** shrinking liquidity is usually a headwind for equities and crypto.
-- **Rates:** higher rates pressure valuation multiples and financing conditions.
-- **Credit:** wider spreads imply rising stress.
-- **Inflation:** sticky inflation reduces room for easing.
-- **Labor:** weaker labor data can confirm slowdown.
-- **Recession:** inversion and labor deterioration increase downturn risk.
-"""
-            )
-
-    with sub_tabs[1]:
-        render_fred_category_section(score_df, fred_data, "Liquidity")
-
-    with sub_tabs[2]:
-        render_fred_category_section(score_df, fred_data, "Rates")
-
-    with sub_tabs[3]:
-        render_fred_category_section(score_df, fred_data, "Credit")
-
-    with sub_tabs[4]:
-        render_fred_category_section(score_df, fred_data, "Inflation")
-
-    with sub_tabs[5]:
-        render_fred_category_section(score_df, fred_data, "Labor")
-
-    with sub_tabs[6]:
-        render_fred_category_section(score_df, fred_data, "Recession")
-
-
-def render_fred_detail_tab():
-    st.subheader("📈 FRED Detail Charts")
-
-    if not FRED_API_KEY:
-        st.error("FRED_API_KEY not found. Please add your FRED API key.")
-        return
-
-    if not selected_detail_series:
-        st.info("Select at least one FRED indicator in the sidebar.")
-        return
-
-    for sid in selected_detail_series:
-        df = fred_data.get(sid, pd.DataFrame())
-        if df.empty:
-            st.warning(f"{sid}: data not available.")
-            continue
-
-        meta = FRED_SERIES[sid]
-        latest, prev = latest_and_prev(df["value"])
-        delta = None if latest is None or prev is None else latest - prev
-        short_pct = compute_short_change(df["value"], sid)
-        yoy_pct = compute_yoy_change(df["value"], sid)
-
-        st.markdown(f"### {meta['name']}")
-        c1, c2, c3, c4 = st.columns([1, 1, 1, 3])
-        c1.metric("Latest", format_num(latest, 2))
-        c2.metric("Change", format_num(delta, 2) if delta is not None else "N/A")
-        c3.metric("YoY %", format_pct(yoy_pct, 2))
-        c4.markdown(f"**Why it matters:** {meta['description']}")
-
-        st.plotly_chart(make_fred_chart(df, meta["name"]), use_container_width=True)
-
 
 # ============================================================
 # Tabs
 # ============================================================
-tab1, tab2, tab3 = st.tabs(
-    ["💱 FX & Macro Market", "🏦 FRED Macro Analysis", "📈 FRED Detail Charts"]
-)
+tab_snapshot, tab_fx, tab_rates, tab_risk, tab_korea, tab_data = st.tabs([
+    "📊 Snapshot",
+    "💱 FX",
+    "📉 Rates",
+    "⚠️ Risk",
+    "🇰🇷 Korea Focus",
+    "🧾 Data Table",
+])
 
-with tab1:
-    render_market_tab()
+# ============================================================
+# Snapshot tab
+# ============================================================
+with tab_snapshot:
+    st.subheader("Global Snapshot Overview")
 
-with tab2:
-    render_fred_macro_tab()
+    focus_assets = [
+        "S&P 500", "Nasdaq 100", "Euro Stoxx 50", "DAX", "Nikkei 225", "KOSPI",
+        "US Dollar Index", "USD/KRW", "EUR/KRW", "WTI", "Gold", "Bitcoin"
+    ]
+    available_focus = [a for a in focus_assets if a in norm_df.columns]
+    if available_focus:
+        st.plotly_chart(
+            make_line_chart(norm_df[available_focus], "Normalized Relative Performance (Base = 100)", "Index Level"),
+            use_container_width=True,
+            key="snapshot_relative_perf"
+        )
 
-with tab3:
-    render_fred_detail_tab()
+    st.markdown("### Snapshot Table")
+    snapshot_show = snapshot_df.copy()
+    numeric_cols = ["Last", "1D %", "1W %", "1M %", "3M %", "1Y %", "52W Position %", "Drawdown %", "Z-score 1Y"]
+    for c in numeric_cols:
+        if c in snapshot_show.columns:
+            snapshot_show[c] = pd.to_numeric(snapshot_show[c], errors="coerce")
 
+    st.dataframe(
+        snapshot_show.sort_values("Asset").style.format({
+            "Last": "{:,.2f}",
+            "1D %": "{:.2f}%",
+            "1W %": "{:.2f}%",
+            "1M %": "{:.2f}%",
+            "3M %": "{:.2f}%",
+            "1Y %": "{:.2f}%",
+            "52W Position %": "{:.1f}",
+            "Drawdown %": "{:.2f}%",
+            "Z-score 1Y": "{:.2f}",
+        }),
+        use_container_width=True
+    )
+
+    st.markdown("### Cross-Asset Heatmap")
+    heat_assets = [
+        "S&P 500", "Nasdaq 100", "Euro Stoxx 50", "KOSPI",
+        "US Dollar Index", "USD/KRW", "EUR/KRW",
+        "WTI", "Gold", "TLT", "TIP", "DBC", "Bitcoin"
+    ]
+    available_heat = [a for a in heat_assets if a in snapshot_df["Asset"].values]
+    if available_heat:
+        heat_df = snapshot_df.set_index("Asset").loc[available_heat, ["1D %", "1W %", "1M %", "3M %", "1Y %"]]
+        st.plotly_chart(
+            make_heatmap(heat_df, "Performance Heatmap"),
+            use_container_width=True,
+            key="snapshot_heatmap"
+        )
+
+# ============================================================
+# FX tab
+# ============================================================
+with tab_fx:
+    st.subheader("FX Monitoring")
+
+    fx_assets = ["USD/KRW", "EUR/KRW", "EUR/USD", "USD/JPY", "USD/CNY", "US Dollar Index"]
+    fx_assets = [a for a in fx_assets if a in close_df.columns]
+
+    col1, col2 = st.columns([1.3, 1.0])
+
+    with col1:
+        if fx_assets:
+            st.plotly_chart(
+                make_line_chart(norm_df[fx_assets], "FX Relative Performance (Base = 100)", "Normalized Level"),
+                use_container_width=True,
+                key="fx_relative_performance"
+            )
+
+    with col2:
+        fx_summary_rows = []
+        for a in fx_assets:
+            s = close_df[a].dropna()
+            if s.empty:
+                continue
+            chg = calc_change_windows(s)
+            fx_summary_rows.append({
+                "Pair": a,
+                "Last": s.iloc[-1],
+                "1D %": chg["1d"],
+                "1M %": chg["1m"],
+                "3M %": chg["3m"],
+                "1Y %": chg["1y"],
+                "52W Position %": calc_percentile_position(s),
+                "Z-score 1Y": zscore_1y[a].dropna().iloc[-1] if not zscore_1y[a].dropna().empty else np.nan,
+            })
+
+        fx_summary_df = pd.DataFrame(fx_summary_rows)
+        if not fx_summary_df.empty:
+            st.dataframe(
+                fx_summary_df.style.format({
+                    "Last": "{:,.2f}",
+                    "1D %": "{:.2f}%",
+                    "1M %": "{:.2f}%",
+                    "3M %": "{:.2f}%",
+                    "1Y %": "{:.2f}%",
+                    "52W Position %": "{:.1f}",
+                    "Z-score 1Y": "{:.2f}",
+                }),
+                use_container_width=True
+            )
+
+    fx_focus = st.selectbox(
+        "Select FX pair",
+        options=fx_assets,
+        index=0 if fx_assets else None,
+        key="fx_focus_select"
+    )
+
+    if fx_focus:
+        price = close_df[fx_focus].dropna()
+        volume = volume_df[fx_focus].dropna() if (show_volume and fx_focus in volume_df.columns) else None
+
+        c1, c2 = st.columns([1.5, 1.0])
+        with c1:
+            st.plotly_chart(
+                make_single_price_chart(price, fx_focus, volume=volume, show_ma=show_moving_avg),
+                use_container_width=True,
+                key=f"fx_price_{fx_focus}"
+            )
+        with c2:
+            if show_drawdown:
+                st.plotly_chart(
+                    make_drawdown_chart(price, fx_focus),
+                    use_container_width=True,
+                    key=f"fx_dd_{fx_focus}"
+                )
+
+        # Interpretation helpers
+        st.markdown("### FX Interpretation Panel")
+
+        sub1, sub2, sub3, sub4 = st.columns(4)
+
+        latest = get_series_last_valid(price)
+        pos52 = calc_percentile_position(price)
+        z1y = zscore_1y[fx_focus].dropna().iloc[-1] if not zscore_1y[fx_focus].dropna().empty else np.nan
+        ddv = compute_drawdown(price).dropna().iloc[-1] if not compute_drawdown(price).dropna().empty else np.nan
+
+        sub1.metric("Latest", format_number(latest, 2))
+        sub2.metric("52W Position", f"{format_number(pos52, 1)} / 100")
+        sub3.metric("1Y Z-score", format_number(z1y, 2))
+        sub4.metric("Drawdown", format_pct(ddv, 2))
+
+        helper_rows = []
+        for helper in ["US Dollar Index", "S&P 500", "KOSPI", "WTI", "Gold"]:
+            if helper in close_df.columns:
+                corr = close_df[[fx_focus, helper]].dropna().pct_change().dropna().corr().iloc[0, 1]
+                helper_rows.append({"Driver": helper, "20D Return Correlation": corr})
+        helper_df = pd.DataFrame(helper_rows)
+        if not helper_df.empty:
+            st.dataframe(
+                helper_df.style.format({"20D Return Correlation": "{:.2f}"}),
+                use_container_width=True
+            )
+
+# ============================================================
+# Rates tab
+# ============================================================
+with tab_rates:
+    st.subheader("Rates & Yield Curve")
+
+    if fred_data:
+        col1, col2 = st.columns([1.2, 1.0])
+
+        with col1:
+            curve_df = build_yield_curve_df(fred_data)
+            if not curve_df["Yield"].dropna().empty:
+                st.plotly_chart(
+                    make_yield_curve_chart(curve_df),
+                    use_container_width=True,
+                    key="rates_yield_curve"
+                )
+            else:
+                st.info("Yield curve data unavailable.")
+
+        with col2:
+            us2y = get_series_last_valid(fred_data.get("US 2Y", pd.Series(dtype=float)))
+            us10y_v = get_series_last_valid(fred_data.get("US 10Y", pd.Series(dtype=float)))
+            us30y_v = get_series_last_valid(fred_data.get("US 30Y", pd.Series(dtype=float)))
+            us3m_v = get_series_last_valid(fred_data.get("US 3M", pd.Series(dtype=float)))
+            real10y = get_series_last_valid(fred_data.get("US Real 10Y", pd.Series(dtype=float)))
+
+            spread_10_2 = us10y_v - us2y if not pd.isna(us10y_v) and not pd.isna(us2y) else np.nan
+            spread_10_3m = us10y_v - us3m_v if not pd.isna(us10y_v) and not pd.isna(us3m_v) else np.nan
+
+            r1, r2 = st.columns(2)
+            r1.metric("US 2Y", format_pct(us2y, 2))
+            r2.metric("US 10Y", format_pct(us10y_v, 2))
+
+            r3, r4 = st.columns(2)
+            r3.metric("10Y - 2Y", format_pct(spread_10_2, 2))
+            r4.metric("10Y - 3M", format_pct(spread_10_3m, 2))
+
+            r5, r6 = st.columns(2)
+            r5.metric("US 30Y", format_pct(us30y_v, 2))
+            r6.metric("Real 10Y", format_pct(real10y, 2))
+
+            st.markdown("#### Quick Read")
+            if not pd.isna(spread_10_2):
+                if spread_10_2 < 0:
+                    st.warning("Yield curve remains inverted or flat: growth concerns / restrictive policy signal.")
+                else:
+                    st.success("Yield curve is positively sloped: less recessionary than inversion regimes.")
+
+        # Historical rates chart
+        chart_candidates = ["US 2Y", "US 10Y", "US 30Y", "US Real 10Y", "Fed Funds Rate"]
+        rate_df = pd.DataFrame({
+            k: fred_data[k] for k in chart_candidates if k in fred_data and not fred_data[k].empty
+        }).dropna(how="all")
+
+        if not rate_df.empty:
+            st.plotly_chart(
+                make_line_chart(rate_df, "US Rates History", "Yield (%)"),
+                use_container_width=True,
+                key="rates_history"
+            )
+
+        # Rates vs TLT
+        if "TLT" in close_df.columns and not rate_df.empty and "US 10Y" in rate_df.columns:
+            aligned = pd.concat(
+                [close_df["TLT"], rate_df["US 10Y"]],
+                axis=1,
+                join="inner"
+            ).dropna()
+            if not aligned.empty:
+                st.plotly_chart(
+                    make_dual_axis_chart(
+                        aligned["TLT"],
+                        aligned["US 10Y"],
+                        "TLT",
+                        "US 10Y Yield",
+                        "TLT vs US 10Y"
+                    ),
+                    use_container_width=True,
+                    key="rates_tlt_dual"
+                )
+    else:
+        st.info("FRED API key not detected. Rates macro panel is limited.")
+        fallback_assets = [a for a in ["TLT", "IEF", "TIP"] if a in norm_df.columns]
+        if fallback_assets:
+            st.plotly_chart(
+                make_line_chart(norm_df[fallback_assets], "Bond ETF Relative Performance", "Index Level"),
+                use_container_width=True,
+                key="rates_fallback_bond_etf"
+            )
+
+# ============================================================
+# Risk tab
+# ============================================================
+with tab_risk:
+    st.subheader("Risk / Credit / Commodities")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    # VIX level
+    c1.metric("VIX", format_number(vix_level, 2))
+    c2.metric("USD/KRW 1M", format_pct(usdkrw_1m, 2))
+    c3.metric("S&P 500 1M", format_pct(spx_1m, 2))
+    c4.metric("WTI 1M", format_pct(wti_1m, 2))
+
+    risk_assets = ["S&P 500", "Nasdaq 100", "KOSPI", "WTI", "Gold", "TLT", "TIP", "DBC", "HYG", "LQD", "US Dollar Index"]
+    risk_assets = [a for a in risk_assets if a in norm_df.columns]
+    if risk_assets:
+        st.plotly_chart(
+            make_line_chart(norm_df[risk_assets], "Cross-Asset Risk Monitoring (Base = 100)", "Index Level"),
+            use_container_width=True,
+            key="risk_cross_asset"
+        )
+
+    left, right = st.columns([1.2, 1.0])
+
+    with left:
+        if fred_data:
+            credit_names = ["US HY OAS", "US IG OAS", "TED Spread"]
+            credit_df = pd.DataFrame({
+                k: fred_data[k] for k in credit_names if k in fred_data and not fred_data[k].empty
+            }).dropna(how="all")
+
+            if not credit_df.empty:
+                st.plotly_chart(
+                    make_line_chart(credit_df, "Credit Stress Indicators", "Spread (%) or Level"),
+                    use_container_width=True,
+                    key="risk_credit_stress"
+                )
+            else:
+                st.info("Credit spread data unavailable from FRED.")
+        else:
+            hyg_lqd_assets = [a for a in ["HYG", "LQD"] if a in close_df.columns]
+            if hyg_lqd_assets:
+                st.plotly_chart(
+                    make_line_chart(norm_df[hyg_lqd_assets], "Credit ETF Relative Performance", "Index Level"),
+                    use_container_width=True,
+                    key="risk_credit_etf"
+                )
+
+    with right:
+        stress_rows = []
+
+        stress_rows.append({
+            "Indicator": "VIX",
+            "Value": vix_level,
+            "Status": get_status_text(vix_level, warn=18, danger=25),
+        })
+
+        stress_rows.append({
+            "Indicator": "USD/KRW 1M Change",
+            "Value": usdkrw_1m,
+            "Status": get_status_text(usdkrw_1m, warn=1.0, danger=3.0),
+        })
+
+        stress_rows.append({
+            "Indicator": "S&P 500 1M Change",
+            "Value": spx_1m,
+            "Status": get_status_text(spx_1m, warn=-2.0, danger=-5.0, reverse=True),
+        })
+
+        stress_rows.append({
+            "Indicator": "WTI 1M Change",
+            "Value": wti_1m,
+            "Status": get_status_text(wti_1m, warn=5.0, danger=10.0),
+        })
+
+        if fred_data:
+            hy_oas = get_series_last_valid(fred_data.get("US HY OAS", pd.Series(dtype=float)))
+            ig_oas = get_series_last_valid(fred_data.get("US IG OAS", pd.Series(dtype=float)))
+            stress_rows.append({
+                "Indicator": "US HY OAS",
+                "Value": hy_oas,
+                "Status": get_status_text(hy_oas, warn=4.5, danger=6.0),
+            })
+            stress_rows.append({
+                "Indicator": "US IG OAS",
+                "Value": ig_oas,
+                "Status": get_status_text(ig_oas, warn=1.5, danger=2.0),
+            })
+
+        stress_df = pd.DataFrame(stress_rows)
+        st.dataframe(
+            stress_df.style.format({"Value": "{:.2f}"}),
+            use_container_width=True
+        )
+
+# ============================================================
+# Korea Focus tab
+# ============================================================
+with tab_korea:
+    st.subheader("Korea Focus")
+
+    korea_assets = ["KOSPI", "KOSDAQ", "USD/KRW", "EUR/KRW", "EWY", "SOX", "US Dollar Index", "WTI", "Copper"]
+    korea_assets = [a for a in korea_assets if a in close_df.columns]
+
+    if korea_assets:
+        st.plotly_chart(
+            make_line_chart(norm_df[korea_assets], "Korea-Focused Relative Performance (Base = 100)", "Index Level"),
+            use_container_width=True,
+            key="korea_relative_perf"
+        )
+
+    kc1, kc2 = st.columns([1.2, 1.0])
+
+    with kc1:
+        compare_options = [a for a in ["KOSPI", "USD/KRW", "SOX", "WTI", "Copper", "US Dollar Index"] if a in close_df.columns]
+        selected_compare = st.multiselect(
+            "Select Korea-related comparison assets",
+            options=compare_options,
+            default=[a for a in ["KOSPI", "USD/KRW", "SOX"] if a in compare_options],
+            key="korea_compare_multiselect"
+        )
+
+        if selected_compare:
+            st.plotly_chart(
+                make_line_chart(norm_df[selected_compare], "Selected Korea Monitoring Assets", "Index Level"),
+                use_container_width=True,
+                key="korea_selected_assets"
+            )
+
+    with kc2:
+        korea_rows = []
+        for a in ["KOSPI", "KOSDAQ", "USD/KRW", "EUR/KRW", "SOX", "WTI", "Copper"]:
+            if a in close_df.columns:
+                s = close_df[a].dropna()
+                chg = calc_change_windows(s)
+                korea_rows.append({
+                    "Asset": a,
+                    "Last": s.iloc[-1],
+                    "1M %": chg["1m"],
+                    "3M %": chg["3m"],
+                    "1Y %": chg["1y"],
+                    "Drawdown %": compute_drawdown(s).iloc[-1],
+                })
+        korea_df = pd.DataFrame(korea_rows)
+        if not korea_df.empty:
+            st.dataframe(
+                korea_df.style.format({
+                    "Last": "{:,.2f}",
+                    "1M %": "{:.2f}%",
+                    "3M %": "{:.2f}%",
+                    "1Y %": "{:.2f}%",
+                    "Drawdown %": "{:.2f}%",
+                }),
+                use_container_width=True
+            )
+
+    st.markdown("### Korea Interpretation Notes")
+    note1, note2, note3 = st.columns(3)
+
+    kospi_1m = calc_change_windows(close_df["KOSPI"].dropna()).get("1m", np.nan) if "KOSPI" in close_df.columns else np.nan
+    sox_1m = calc_change_windows(close_df["SOX"].dropna()).get("1m", np.nan) if "SOX" in close_df.columns else np.nan
+    copper_1m = calc_change_windows(close_df["Copper"].dropna()).get("1m", np.nan) if "Copper" in close_df.columns else np.nan
+
+    note1.metric("KOSPI 1M", format_pct(kospi_1m, 2))
+    note2.metric("SOX 1M", format_pct(sox_1m, 2))
+    note3.metric("Copper 1M", format_pct(copper_1m, 2))
+
+    interp = []
+    if not pd.isna(usdkrw_1m) and usdkrw_1m > 2:
+        interp.append("- USD/KRW 상승 폭이 커서 원화 약세 압력이 강화된 상태입니다.")
+    if not pd.isna(sox_1m) and sox_1m > 3:
+        interp.append("- 반도체 업황 기대가 한국 수출/대형주 심리에 우호적일 수 있습니다.")
+    if not pd.isna(wti_1m) and wti_1m > 8:
+        interp.append("- 유가 급등은 한국처럼 에너지 수입 의존 경제에 부담이 될 수 있습니다.")
+    if not pd.isna(copper_1m) and copper_1m < -5:
+        interp.append("- 구리 약세는 글로벌 경기 둔화 신호로 해석될 수 있습니다.")
+    if not interp:
+        interp.append("- 현재 Korea panel 상에서는 뚜렷한 단일 스트레스 신호보다 혼합 신호가 보입니다.")
+
+    for line in interp:
+        st.write(line)
+
+# ============================================================
+# Data Table tab
+# ============================================================
+with tab_data:
+    st.subheader("Raw Monitoring Tables")
+
+    st.markdown("### Latest Snapshot")
+    st.dataframe(
+        snapshot_df.sort_values("Asset").reset_index(drop=True).style.format({
+            "Last": "{:,.2f}",
+            "1D %": "{:.2f}%",
+            "1W %": "{:.2f}%",
+            "1M %": "{:.2f}%",
+            "3M %": "{:.2f}%",
+            "1Y %": "{:.2f}%",
+            "52W Position %": "{:.1f}",
+            "Drawdown %": "{:.2f}%",
+            "Z-score 1Y": "{:.2f}",
+        }),
+        use_container_width=True
+    )
+
+    st.markdown("### Downloadable Price Data")
+    price_export = close_df.copy()
+    csv = price_export.to_csv().encode("utf-8")
+    st.download_button(
+        label="Download price history CSV",
+        data=csv,
+        file_name="global_market_overview_prices.csv",
+        mime="text/csv",
+        key="download_price_csv"
+    )
+
+    if fred_data:
+        st.markdown("### FRED Series Latest Values")
+        fred_rows = []
+        for name, s in fred_data.items():
+            if s is not None and not s.dropna().empty:
+                fred_rows.append({
+                    "Series": name,
+                    "Last": s.dropna().iloc[-1],
+                    "Date": s.dropna().index[-1].strftime("%Y-%m-%d"),
+                })
+        fred_df = pd.DataFrame(fred_rows)
+        if not fred_df.empty:
+            st.dataframe(
+                fred_df.style.format({"Last": "{:,.4f}"}),
+                use_container_width=True
+            )
 
 # ============================================================
 # Footer
 # ============================================================
-with st.expander("Suggested Next Updates"):
-    st.markdown(
-        """
-### Recommended upgrades
-
-1. Add relative performance summary
-   - 1M / 3M / 6M / 1Y returns table
-
-2. Add cross-market comparison charts
-   - DXY vs USD/KRW
-   - Gold vs BTC
-   - WTI vs Brent
-
-3. Add rolling correlation panel
-   - 30D / 90D correlation
-
-4. Add alert thresholds
-   - USD/KRW breakout
-   - EUR/KRW breakout
-   - HY spread spike
-   - Yield curve inversion
-
-5. Add portfolio implication section
-   - Equity
-   - Bonds
-   - Gold
-   - Commodities
-   - Cash
-
-6. Add Germany / Korea interpretation cards
-   - KRW weakness warning
-   - EUR strength and living cost pressure
-   - Oil price and inflation burden
-"""
-    )
+st.markdown("---")
+st.caption(
+    "Tip: Add a valid FRED API key to unlock richer rates, credit, and macro sections. "
+    "Yahoo Finance symbols may occasionally vary by region/data availability."
+)
