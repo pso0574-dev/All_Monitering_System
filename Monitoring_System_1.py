@@ -1,36 +1,42 @@
 # streamlit_app.py
 # ============================================================
-# Global Market Overview Dashboard (Improved Visibility Version)
-# - Fix empty charts caused by normalization with NaN
-# - Adjustable font sizes
-# - Adjustable chart height
-# - Adjustable number of metric cards per row
-# - Better layout for small/medium screens
+# Global Market Overview Dashboard
+# Robust version:
+# - fixes blank charts caused by yfinance column parsing issues
+# - per-series normalization
+# - adjustable summary font sizes
+# - adjustable metric cards per row
+# - safer chart rendering with no-data handling
 #
 # Install:
 #   pip install streamlit yfinance pandas numpy plotly requests
 #
 # Run:
 #   streamlit run streamlit_app.py
+#
+# Optional:
+#   Set FRED_API_KEY in environment variable
+#   or .streamlit/secrets.toml
+#   FRED_API_KEY="YOUR_API_KEY"
 # ============================================================
 
 from __future__ import annotations
 
 import os
-import requests
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import requests
 import streamlit as st
 import yfinance as yf
 
 
 # ============================================================
-# Page setup
+# Page config
 # ============================================================
 st.set_page_config(
     page_title="Global Market Overview Dashboard",
@@ -39,11 +45,11 @@ st.set_page_config(
 )
 
 st.title("🌍 Global Market Overview Dashboard")
-st.caption("Integrated monitoring view for equities, FX, rates, risk, commodities, and Korea-specific signals")
+st.caption("Integrated monitoring for equities, FX, rates, credit, commodities, and Korea-focused signals")
 
 
 # ============================================================
-# Sidebar controls
+# Sidebar
 # ============================================================
 st.sidebar.header("Display Settings")
 
@@ -61,18 +67,20 @@ plot_theme = st.sidebar.selectbox(
     index=0,
 )
 
-base_font_size = st.sidebar.slider("Base font size", 10, 24, 15)
+base_font_size = st.sidebar.slider("Base font size", 10, 24, 14)
 title_font_size = st.sidebar.slider("Chart title font size", 14, 32, 22)
 axis_font_size = st.sidebar.slider("Axis font size", 10, 24, 14)
-legend_font_size = st.sidebar.slider("Legend font size", 10, 22, 13)
-metric_value_size = st.sidebar.slider("Metric value font size", 18, 48, 28)
-metric_label_size = st.sidebar.slider("Metric label font size", 10, 24, 16)
-chart_height = st.sidebar.slider("Default chart height", 300, 900, 460)
-metric_cards_per_row = st.sidebar.slider("Metric cards per row", 3, 8, 5)
+legend_font_size = st.sidebar.slider("Legend font size", 10, 22, 12)
+
+metric_label_size = st.sidebar.slider("Summary label font size", 10, 26, 15)
+metric_value_size = st.sidebar.slider("Summary value font size", 18, 52, 30)
+metric_delta_size = st.sidebar.slider("Summary delta font size", 10, 24, 13)
+
+chart_height = st.sidebar.slider("Default chart height", 320, 900, 460)
+metric_cards_per_row = st.sidebar.slider("Summary cards per row", 3, 8, 5)
 
 show_moving_avg = st.sidebar.checkbox("Show moving averages", value=True)
 show_drawdown = st.sidebar.checkbox("Show drawdown chart", value=True)
-show_volume = st.sidebar.checkbox("Show volume where available", value=False)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Optional FRED")
@@ -87,11 +95,11 @@ if not FRED_API_KEY:
 if FRED_API_KEY:
     st.sidebar.success("FRED API key detected")
 else:
-    st.sidebar.warning("No FRED API key found. Rates / macro section will be limited.")
+    st.sidebar.warning("No FRED API key found. Rates / macro panel will be limited.")
 
 
 # ============================================================
-# CSS for metric font control
+# CSS for metric font sizes
 # ============================================================
 st.markdown(
     f"""
@@ -110,7 +118,8 @@ st.markdown(
         line-height: 1.0 !important;
     }}
     div[data-testid="metric-container"] [data-testid="stMetricDelta"] {{
-        font-size: {max(metric_label_size - 1, 10)}px !important;
+        font-size: {metric_delta_size}px !important;
+        line-height: 1.0 !important;
     }}
     </style>
     """,
@@ -119,7 +128,7 @@ st.markdown(
 
 
 # ============================================================
-# Market universe
+# Universe
 # ============================================================
 MARKET_TICKERS = {
     "S&P 500": "^GSPC",
@@ -200,6 +209,13 @@ def safe_pct(a: float, b: float) -> float:
         return np.nan
 
 
+def get_last_valid(s: pd.Series) -> float:
+    s = s.dropna()
+    if s.empty:
+        return np.nan
+    return float(s.iloc[-1])
+
+
 def compute_drawdown(price: pd.Series) -> pd.Series:
     if price.empty:
         return price
@@ -241,13 +257,6 @@ def calc_percentile_position(s: pd.Series, window: int = 252) -> float:
     return (cur - min_v) / (max_v - min_v) * 100.0
 
 
-def get_last_valid(s: pd.Series) -> float:
-    s = s.dropna()
-    if s.empty:
-        return np.nan
-    return float(s.iloc[-1])
-
-
 def normalize_each_column(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     for col in df.columns:
@@ -277,13 +286,25 @@ def get_plot_layout(title: str, yaxis_title: str = "", height: Optional[int] = N
             x=0,
             font=dict(size=legend_font_size),
         ),
-        xaxis=dict(title_font=dict(size=axis_font_size), tickfont=dict(size=axis_font_size)),
-        yaxis=dict(title=yaxis_title, title_font=dict(size=axis_font_size), tickfont=dict(size=axis_font_size)),
+        xaxis=dict(
+            title_font=dict(size=axis_font_size),
+            tickfont=dict(size=axis_font_size),
+            showgrid=True,
+            zeroline=False,
+        ),
+        yaxis=dict(
+            title=yaxis_title,
+            title_font=dict(size=axis_font_size),
+            tickfont=dict(size=axis_font_size),
+            showgrid=True,
+            zeroline=False,
+        ),
     )
 
 
 def classify_regime(vix_level: float, usdkrw_1m: float, spx_1m: float, wti_1m: float) -> str:
     score = 0
+
     if not pd.isna(vix_level):
         if vix_level > 25:
             score += 2
@@ -310,10 +331,11 @@ def classify_regime(vix_level: float, usdkrw_1m: float, spx_1m: float, wti_1m: f
         return "🔴 Risk-off / Stress"
     elif score >= 3:
         return "🟠 Cautious / Inflation Pressure"
-    return "🟢 Balanced / Risk-on"
+    else:
+        return "🟢 Balanced / Risk-on"
 
 
-def show_metrics_in_rows(items: List[tuple], per_row: int = 5):
+def show_metrics_in_rows(items: List[tuple], per_row: int = 5) -> None:
     for i in range(0, len(items), per_row):
         row_items = items[i:i + per_row]
         cols = st.columns(len(row_items))
@@ -321,17 +343,29 @@ def show_metrics_in_rows(items: List[tuple], per_row: int = 5):
             c.metric(label, value, delta)
 
 
+def build_nonempty_columns(df: pd.DataFrame, candidates: List[str]) -> List[str]:
+    out = []
+    for c in candidates:
+        if c in df.columns and not df[c].dropna().empty:
+            out.append(c)
+    return out
+
+
 # ============================================================
 # Data loaders
 # ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yahoo_data(tickers: Dict[str, str], period_days: int = 730) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def fetch_yahoo_data(
+    tickers: Dict[str, str],
+    period_days: int = 730
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     end = datetime.today()
     start = end - timedelta(days=period_days)
 
     ticker_list = list(tickers.values())
+
     raw = yf.download(
-        ticker_list,
+        tickers=ticker_list,
         start=start.strftime("%Y-%m-%d"),
         end=(end + timedelta(days=1)).strftime("%Y-%m-%d"),
         auto_adjust=True,
@@ -346,43 +380,78 @@ def fetch_yahoo_data(tickers: Dict[str, str], period_days: int = 730) -> Tuple[p
     close = pd.DataFrame(index=raw.index)
     volume = pd.DataFrame(index=raw.index)
 
-    inverse = {v: k for k, v in tickers.items()}
+    inverse_map = {v: k for k, v in tickers.items()}
 
     if isinstance(raw.columns, pd.MultiIndex):
-        for ticker in ticker_list:
-            label = inverse.get(ticker, ticker)
-            try:
+        level0 = list(raw.columns.get_level_values(0).unique())
+        level1 = list(raw.columns.get_level_values(1).unique())
+
+        # Pattern A: (Ticker, Field)
+        if any(t in level0 for t in ticker_list):
+            for ticker in ticker_list:
+                label = inverse_map.get(ticker, ticker)
+
                 if (ticker, "Close") in raw.columns:
                     close[label] = raw[(ticker, "Close")]
-                elif "Close" in raw.columns.get_level_values(-1):
-                    sub = raw[ticker]
-                    if "Close" in sub.columns:
-                        close[label] = sub["Close"]
+                elif (ticker, "Adj Close") in raw.columns:
+                    close[label] = raw[(ticker, "Adj Close")]
 
                 if (ticker, "Volume") in raw.columns:
                     volume[label] = raw[(ticker, "Volume")]
-                elif "Volume" in raw.columns.get_level_values(-1):
+
+        # Pattern B: (Field, Ticker)
+        elif "Close" in level0 or "Adj Close" in level0:
+            field_close = "Close" if "Close" in level0 else "Adj Close"
+
+            if field_close in raw.columns.get_level_values(0):
+                tmp_close = raw[field_close].copy()
+                tmp_close = tmp_close.rename(columns=inverse_map)
+                for c in tmp_close.columns:
+                    close[c] = tmp_close[c]
+
+            if "Volume" in raw.columns.get_level_values(0):
+                tmp_volume = raw["Volume"].copy()
+                tmp_volume = tmp_volume.rename(columns=inverse_map)
+                for c in tmp_volume.columns:
+                    volume[c] = tmp_volume[c]
+
+        # Pattern C fallback
+        else:
+            for ticker in ticker_list:
+                label = inverse_map.get(ticker, ticker)
+                try:
                     sub = raw[ticker]
+                    if "Close" in sub.columns:
+                        close[label] = sub["Close"]
+                    elif "Adj Close" in sub.columns:
+                        close[label] = sub["Adj Close"]
+
                     if "Volume" in sub.columns:
                         volume[label] = sub["Volume"]
-            except Exception:
-                continue
+                except Exception:
+                    continue
+
     else:
-        # single ticker fallback
+        # Single ticker fallback
+        only_label = list(tickers.keys())[0]
         if "Close" in raw.columns:
-            only_label = list(tickers.keys())[0]
             close[only_label] = raw["Close"]
+        elif "Adj Close" in raw.columns:
+            close[only_label] = raw["Adj Close"]
+
         if "Volume" in raw.columns:
-            only_label = list(tickers.keys())[0]
             volume[only_label] = raw["Volume"]
 
     close = close.sort_index().dropna(how="all")
     volume = volume.sort_index().dropna(how="all")
 
-    ordered_close = [c for c in tickers.keys() if c in close.columns]
-    ordered_volume = [c for c in tickers.keys() if c in volume.columns]
+    ordered_close = [k for k in tickers.keys() if k in close.columns]
+    ordered_volume = [k for k in tickers.keys() if k in volume.columns]
 
-    return close[ordered_close], volume[ordered_volume]
+    close = close[ordered_close] if ordered_close else close
+    volume = volume[ordered_volume] if ordered_volume else volume
+
+    return close, volume
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -437,7 +506,7 @@ with st.spinner("Loading market data..."):
     fred_data = load_fred_bundle(FRED_SERIES) if FRED_API_KEY else {}
 
 if close_df.empty:
-    st.error("Failed to load Yahoo Finance data.")
+    st.error("Failed to load Yahoo Finance data. Please retry.")
     st.stop()
 
 
@@ -453,7 +522,9 @@ for asset in close_df.columns:
     s = close_df[asset].dropna()
     if s.empty:
         continue
+
     chg = calc_change_windows(s)
+
     snapshot_rows.append({
         "Asset": asset,
         "Last": s.iloc[-1],
@@ -462,7 +533,7 @@ for asset in close_df.columns:
         "1M %": chg["1m"],
         "3M %": chg["3m"],
         "1Y %": chg["1y"],
-        "52W Position %": calc_percentile_position(s, 252),
+        "52W Position %": calc_percentile_position(s),
         "Drawdown %": compute_drawdown(s).iloc[-1],
         "Z-score 1Y": zscore_1y[asset].dropna().iloc[-1] if not zscore_1y[asset].dropna().empty else np.nan,
     })
@@ -480,11 +551,13 @@ wti_1m = calc_change_windows(wti)["1m"] if not wti.empty else np.nan
 
 vix_level = np.nan
 try:
-    vix_raw = yf.download("^VIX", period="2y", auto_adjust=True, progress=False)
+    vix_raw = yf.download("^VIX", period="2y", auto_adjust=True, progress=False, group_by="ticker")
     if not vix_raw.empty:
         if isinstance(vix_raw.columns, pd.MultiIndex):
             if ("^VIX", "Close") in vix_raw.columns:
                 vix_level = float(vix_raw[("^VIX", "Close")].dropna().iloc[-1])
+            elif ("Close", "^VIX") in vix_raw.columns:
+                vix_level = float(vix_raw[("Close", "^VIX")].dropna().iloc[-1])
         elif "Close" in vix_raw.columns:
             vix_level = float(vix_raw["Close"].dropna().iloc[-1])
 except Exception:
@@ -500,18 +573,34 @@ def make_line_chart(df: pd.DataFrame, title: str, yaxis_title: str = "", height:
     df = df.dropna(how="all")
     fig = go.Figure()
 
+    added = 0
     for col in df.columns:
         s = df[col].dropna()
         if s.empty:
             continue
-        fig.add_trace(go.Scatter(
-            x=s.index,
-            y=s.values,
-            mode="lines",
-            name=col,
-        ))
+        fig.add_trace(
+            go.Scatter(
+                x=s.index,
+                y=s.values,
+                mode="lines",
+                name=col,
+            )
+        )
+        added += 1
 
     fig.update_layout(**get_plot_layout(title, yaxis_title, height))
+
+    if added == 0:
+        fig.add_annotation(
+            text="No valid data available",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(size=title_font_size),
+        )
+
     return fig
 
 
@@ -519,17 +608,23 @@ def make_single_price_chart(price: pd.Series, name: str, show_ma: bool = True, h
     s = price.dropna()
     fig = go.Figure()
 
-    fig.add_trace(go.Scatter(
-        x=s.index,
-        y=s.values,
-        mode="lines",
-        name=name,
-    ))
+    if not s.empty:
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=name))
 
-    if show_ma and not s.empty:
-        fig.add_trace(go.Scatter(x=s.index, y=s.rolling(20).mean(), mode="lines", name="MA20"))
-        fig.add_trace(go.Scatter(x=s.index, y=s.rolling(50).mean(), mode="lines", name="MA50"))
-        fig.add_trace(go.Scatter(x=s.index, y=s.rolling(200).mean(), mode="lines", name="MA200"))
+        if show_ma:
+            fig.add_trace(go.Scatter(x=s.index, y=s.rolling(20).mean(), mode="lines", name="MA20"))
+            fig.add_trace(go.Scatter(x=s.index, y=s.rolling(50).mean(), mode="lines", name="MA50"))
+            fig.add_trace(go.Scatter(x=s.index, y=s.rolling(200).mean(), mode="lines", name="MA200"))
+    else:
+        fig.add_annotation(
+            text="No valid price data",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(size=title_font_size),
+        )
 
     fig.update_layout(**get_plot_layout(f"{name} Price Trend", "", height))
     return fig
@@ -538,19 +633,48 @@ def make_single_price_chart(price: pd.Series, name: str, show_ma: bool = True, h
 def make_drawdown_chart(price: pd.Series, name: str, height: Optional[int] = None) -> go.Figure:
     dd = compute_drawdown(price).dropna()
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=dd.index,
-        y=dd.values,
-        mode="lines",
-        name=f"{name} Drawdown",
-        fill="tozeroy",
-    ))
+
+    if not dd.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=dd.index,
+                y=dd.values,
+                mode="lines",
+                name=f"{name} Drawdown",
+                fill="tozeroy",
+            )
+        )
+    else:
+        fig.add_annotation(
+            text="No valid drawdown data",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(size=title_font_size),
+        )
+
     fig.update_layout(**get_plot_layout(f"{name} Drawdown vs Previous Peak", "Drawdown (%)", height or 340))
     return fig
 
 
 def make_heatmap(df: pd.DataFrame, title: str, height: Optional[int] = None) -> go.Figure:
     plot_df = df.copy().dropna(how="all")
+    if plot_df.empty:
+        fig = go.Figure()
+        fig.update_layout(**get_plot_layout(title, "", height))
+        fig.add_annotation(
+            text="No valid heatmap data",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(size=title_font_size),
+        )
+        return fig
+
     fig = px.imshow(
         plot_df,
         aspect="auto",
@@ -568,14 +692,30 @@ def make_heatmap(df: pd.DataFrame, title: str, height: Optional[int] = None) -> 
 
 def make_yield_curve_chart(curve_df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=curve_df["Maturity"],
-        y=curve_df["Yield"],
-        mode="lines+markers+text",
-        text=[f"{v:.2f}%" if not pd.isna(v) else "N/A" for v in curve_df["Yield"]],
-        textposition="top center",
-        name="US Curve",
-    ))
+
+    valid = curve_df.dropna(subset=["Yield"])
+    if not valid.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=valid["Maturity"],
+                y=valid["Yield"],
+                mode="lines+markers+text",
+                text=[f"{v:.2f}%" for v in valid["Yield"]],
+                textposition="top center",
+                name="US Curve",
+            )
+        )
+    else:
+        fig.add_annotation(
+            text="No valid yield curve data",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(size=title_font_size),
+        )
+
     fig.update_layout(**get_plot_layout("US Yield Curve", "Yield (%)", 420))
     fig.update_xaxes(title_text="Maturity (Years)")
     return fig
@@ -589,26 +729,40 @@ def make_dual_axis_chart(
     title: str,
     height: Optional[int] = None,
 ) -> go.Figure:
-    ls = left_series.dropna()
-    rs = right_series.dropna()
-    aligned = pd.concat([ls, rs], axis=1).dropna()
+    aligned = pd.concat([left_series, right_series], axis=1).dropna()
     aligned.columns = [left_name, right_name]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=aligned.index,
-        y=aligned[left_name],
-        mode="lines",
-        name=left_name,
-        yaxis="y1",
-    ))
-    fig.add_trace(go.Scatter(
-        x=aligned.index,
-        y=aligned[right_name],
-        mode="lines",
-        name=right_name,
-        yaxis="y2",
-    ))
+
+    if not aligned.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=aligned.index,
+                y=aligned[left_name],
+                mode="lines",
+                name=left_name,
+                yaxis="y1",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=aligned.index,
+                y=aligned[right_name],
+                mode="lines",
+                name=right_name,
+                yaxis="y2",
+            )
+        )
+    else:
+        fig.add_annotation(
+            text="No valid aligned data",
+            xref="paper",
+            yref="paper",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(size=title_font_size),
+        )
 
     fig.update_layout(
         title=dict(text=title, font=dict(size=title_font_size)),
@@ -631,7 +785,7 @@ def make_dual_axis_chart(
 
 
 # ============================================================
-# Header metrics
+# Top summary
 # ============================================================
 st.subheader("Market Regime")
 st.info(regime)
@@ -674,22 +828,24 @@ tab_snapshot, tab_fx, tab_rates, tab_risk, tab_korea, tab_data = st.tabs([
 
 
 # ============================================================
-# Snapshot tab
+# Snapshot
 # ============================================================
 with tab_snapshot:
     st.subheader("Global Snapshot Overview")
 
-    focus_assets = [
-        "S&P 500", "Nasdaq 100", "Euro Stoxx 50", "DAX", "Nikkei 225",
-        "KOSPI", "US Dollar Index", "USD/KRW", "EUR/KRW", "WTI", "Gold", "Bitcoin"
-    ]
-    available_focus = [a for a in focus_assets if a in norm_df.columns and not norm_df[a].dropna().empty]
+    focus_assets = build_nonempty_columns(
+        norm_df,
+        [
+            "S&P 500", "Nasdaq 100", "Euro Stoxx 50", "DAX", "Nikkei 225",
+            "KOSPI", "US Dollar Index", "USD/KRW", "EUR/KRW", "WTI", "Gold", "Bitcoin"
+        ],
+    )
 
-    if available_focus:
+    if focus_assets:
         st.plotly_chart(
-            make_line_chart(norm_df[available_focus], "Normalized Relative Performance (Base = 100)", "Index Level"),
+            make_line_chart(norm_df[focus_assets], "Normalized Relative Performance (Base = 100)", "Index Level"),
             use_container_width=True,
-            key="snapshot_relative_perf"
+            key="snapshot_relative_perf",
         )
     else:
         st.warning("No valid normalized data available for snapshot chart.")
@@ -707,7 +863,7 @@ with tab_snapshot:
             "Drawdown %": "{:.2f}%",
             "Z-score 1Y": "{:.2f}",
         }),
-        use_container_width=True
+        use_container_width=True,
     )
 
     heat_assets = [
@@ -721,28 +877,30 @@ with tab_snapshot:
         st.plotly_chart(
             make_heatmap(heat_df, "Performance Heatmap"),
             use_container_width=True,
-            key="snapshot_heatmap"
+            key="snapshot_heatmap",
         )
 
 
 # ============================================================
-# FX tab
+# FX
 # ============================================================
 with tab_fx:
     st.subheader("FX Monitoring")
 
-    fx_assets = ["USD/KRW", "EUR/KRW", "EUR/USD", "USD/JPY", "USD/CNY", "US Dollar Index"]
-    fx_assets = [a for a in fx_assets if a in close_df.columns and not close_df[a].dropna().empty]
+    fx_assets = build_nonempty_columns(
+        close_df,
+        ["USD/KRW", "EUR/KRW", "EUR/USD", "USD/JPY", "USD/CNY", "US Dollar Index"]
+    )
 
     col1, col2 = st.columns([1.35, 1.0])
 
     with col1:
-        fx_norm_assets = [a for a in fx_assets if a in norm_df.columns and not norm_df[a].dropna().empty]
+        fx_norm_assets = build_nonempty_columns(norm_df, fx_assets)
         if fx_norm_assets:
             st.plotly_chart(
                 make_line_chart(norm_df[fx_norm_assets], "FX Relative Performance (Base = 100)", "Normalized Level"),
                 use_container_width=True,
-                key="fx_relative_performance"
+                key="fx_relative_performance",
             )
         else:
             st.warning("FX normalized chart data is unavailable.")
@@ -777,7 +935,7 @@ with tab_fx:
                     "52W Position %": "{:.1f}",
                     "Z-score 1Y": "{:.2f}",
                 }),
-                use_container_width=True
+                use_container_width=True,
             )
 
     if fx_assets:
@@ -790,7 +948,7 @@ with tab_fx:
             st.plotly_chart(
                 make_single_price_chart(price, fx_focus, show_ma=show_moving_avg),
                 use_container_width=True,
-                key=f"fx_price_{fx_focus}"
+                key=f"fx_price_{fx_focus}",
             )
 
         with right:
@@ -798,7 +956,7 @@ with tab_fx:
                 st.plotly_chart(
                     make_drawdown_chart(price, fx_focus),
                     use_container_width=True,
-                    key=f"fx_dd_{fx_focus}"
+                    key=f"fx_dd_{fx_focus}",
                 )
 
         st.markdown("### FX Interpretation Panel")
@@ -826,12 +984,12 @@ with tab_fx:
             helper_df = pd.DataFrame(helper_rows)
             st.dataframe(
                 helper_df.style.format({"Return Correlation": "{:.2f}"}),
-                use_container_width=True
+                use_container_width=True,
             )
 
 
 # ============================================================
-# Rates tab
+# Rates
 # ============================================================
 with tab_rates:
     st.subheader("Rates & Yield Curve")
@@ -853,7 +1011,7 @@ with tab_rates:
             st.plotly_chart(
                 make_yield_curve_chart(curve_df),
                 use_container_width=True,
-                key="rates_yield_curve"
+                key="rates_yield_curve",
             )
 
         with c2:
@@ -873,7 +1031,8 @@ with tab_rates:
             r6.metric("Real 10Y", format_pct(real10y, 2))
 
         rate_df = pd.DataFrame({
-            k: fred_data[k] for k in ["US 2Y", "US 10Y", "US 30Y", "US Real 10Y", "Fed Funds Rate"]
+            k: fred_data[k]
+            for k in ["US 2Y", "US 10Y", "US 30Y", "US Real 10Y", "Fed Funds Rate"]
             if k in fred_data and not fred_data[k].empty
         }).dropna(how="all")
 
@@ -881,28 +1040,28 @@ with tab_rates:
             st.plotly_chart(
                 make_line_chart(rate_df, "US Rates History", "Yield (%)"),
                 use_container_width=True,
-                key="rates_history"
+                key="rates_history",
             )
 
         if "TLT" in close_df.columns and "US 10Y" in rate_df.columns:
             st.plotly_chart(
                 make_dual_axis_chart(close_df["TLT"], rate_df["US 10Y"], "TLT", "US 10Y Yield", "TLT vs US 10Y"),
                 use_container_width=True,
-                key="rates_tlt_dual"
+                key="rates_tlt_dual",
             )
     else:
         st.info("FRED API key not detected. Showing ETF-based rate proxies only.")
-        bond_assets = [a for a in ["TLT", "IEF", "TIP"] if a in norm_df.columns and not norm_df[a].dropna().empty]
+        bond_assets = build_nonempty_columns(norm_df, ["TLT", "IEF", "TIP"])
         if bond_assets:
             st.plotly_chart(
                 make_line_chart(norm_df[bond_assets], "Bond ETF Relative Performance", "Index Level"),
                 use_container_width=True,
-                key="rates_fallback_bond_etf"
+                key="rates_fallback_bond_etf",
             )
 
 
 # ============================================================
-# Risk tab
+# Risk
 # ============================================================
 with tab_risk:
     st.subheader("Risk / Credit / Commodities")
@@ -913,22 +1072,27 @@ with tab_risk:
     rc3.metric("S&P 500 1M", format_pct(spx_1m, 2))
     rc4.metric("WTI 1M", format_pct(wti_1m, 2))
 
-    risk_assets = ["S&P 500", "Nasdaq 100", "KOSPI", "WTI", "Gold", "TLT", "TIP", "DBC", "HYG", "LQD", "US Dollar Index"]
-    risk_assets = [a for a in risk_assets if a in norm_df.columns and not norm_df[a].dropna().empty]
+    risk_assets = build_nonempty_columns(
+        norm_df,
+        ["S&P 500", "Nasdaq 100", "KOSPI", "WTI", "Gold", "TLT", "TIP", "DBC", "HYG", "LQD", "US Dollar Index"]
+    )
 
     if risk_assets:
         st.plotly_chart(
             make_line_chart(norm_df[risk_assets], "Cross-Asset Risk Monitoring (Base = 100)", "Index Level"),
             use_container_width=True,
-            key="risk_cross_asset"
+            key="risk_cross_asset",
         )
+    else:
+        st.warning("No valid risk monitoring data available.")
 
     left, right = st.columns([1.2, 1.0])
 
     with left:
         if fred_data:
             credit_df = pd.DataFrame({
-                k: fred_data[k] for k in ["US HY OAS", "US IG OAS", "TED Spread"]
+                k: fred_data[k]
+                for k in ["US HY OAS", "US IG OAS", "TED Spread"]
                 if k in fred_data and not fred_data[k].empty
             }).dropna(how="all")
 
@@ -936,15 +1100,15 @@ with tab_risk:
                 st.plotly_chart(
                     make_line_chart(credit_df, "Credit Stress Indicators", "Spread / Level"),
                     use_container_width=True,
-                    key="risk_credit_stress"
+                    key="risk_credit_stress",
                 )
         else:
-            cred_assets = [a for a in ["HYG", "LQD"] if a in norm_df.columns and not norm_df[a].dropna().empty]
+            cred_assets = build_nonempty_columns(norm_df, ["HYG", "LQD"])
             if cred_assets:
                 st.plotly_chart(
                     make_line_chart(norm_df[cred_assets], "Credit ETF Relative Performance", "Index Level"),
                     use_container_width=True,
-                    key="risk_credit_etf"
+                    key="risk_credit_etf",
                 )
 
     with right:
@@ -962,42 +1126,50 @@ with tab_risk:
         stress_df = pd.DataFrame(stress_rows)
         st.dataframe(
             stress_df.style.format({"Value": "{:.2f}"}),
-            use_container_width=True
+            use_container_width=True,
         )
 
 
 # ============================================================
-# Korea Focus tab
+# Korea Focus
 # ============================================================
 with tab_korea:
     st.subheader("Korea Focus")
 
-    korea_assets = ["KOSPI", "KOSDAQ", "USD/KRW", "EUR/KRW", "EWY", "SOX", "US Dollar Index", "WTI", "Copper"]
-    korea_assets = [a for a in korea_assets if a in norm_df.columns and not norm_df[a].dropna().empty]
+    korea_assets = build_nonempty_columns(
+        norm_df,
+        ["KOSPI", "KOSDAQ", "USD/KRW", "EUR/KRW", "EWY", "SOX", "US Dollar Index", "WTI", "Copper"]
+    )
 
     if korea_assets:
         st.plotly_chart(
             make_line_chart(norm_df[korea_assets], "Korea-Focused Relative Performance (Base = 100)", "Index Level"),
             use_container_width=True,
-            key="korea_relative_perf"
+            key="korea_relative_perf",
         )
+    else:
+        st.warning("No valid Korea-focused data available.")
 
     kc1, kc2 = st.columns([1.2, 1.0])
 
     with kc1:
-        compare_options = [a for a in ["KOSPI", "USD/KRW", "SOX", "WTI", "Copper", "US Dollar Index"] if a in norm_df.columns]
+        compare_options = build_nonempty_columns(
+            norm_df,
+            ["KOSPI", "USD/KRW", "SOX", "WTI", "Copper", "US Dollar Index"]
+        )
+
         selected_compare = st.multiselect(
             "Select Korea-related comparison assets",
             options=compare_options,
             default=[a for a in ["KOSPI", "USD/KRW", "SOX"] if a in compare_options],
-            key="korea_compare_multiselect"
+            key="korea_compare_multiselect",
         )
 
         if selected_compare:
             st.plotly_chart(
                 make_line_chart(norm_df[selected_compare], "Selected Korea Monitoring Assets", "Index Level"),
                 use_container_width=True,
-                key="korea_selected_assets"
+                key="korea_selected_assets",
             )
 
     with kc2:
@@ -1025,12 +1197,12 @@ with tab_korea:
                     "1Y %": "{:.2f}%",
                     "Drawdown %": "{:.2f}%",
                 }),
-                use_container_width=True
+                use_container_width=True,
             )
 
 
 # ============================================================
-# Data tab
+# Data Table
 # ============================================================
 with tab_data:
     st.subheader("Raw Monitoring Tables")
@@ -1047,8 +1219,14 @@ with tab_data:
             "Drawdown %": "{:.2f}%",
             "Z-score 1Y": "{:.2f}",
         }),
-        use_container_width=True
+        use_container_width=True,
     )
+
+    st.markdown("### Debug: Loaded Market Columns")
+    st.write(list(close_df.columns))
+
+    st.markdown("### Debug: Non-empty Column Count")
+    st.write(int(sum(~close_df.isna().all(axis=0))))
 
     csv = close_df.to_csv().encode("utf-8")
     st.download_button(
@@ -1056,7 +1234,7 @@ with tab_data:
         data=csv,
         file_name="global_market_overview_prices.csv",
         mime="text/csv",
-        key="download_price_csv"
+        key="download_price_csv",
     )
 
 
@@ -1064,4 +1242,7 @@ with tab_data:
 # Footer
 # ============================================================
 st.markdown("---")
-st.caption("Main fixes applied: per-series normalization, empty-chart prevention, adjustable font sizes, and metric row control.")
+st.caption(
+    "This version fixes blank charts with robust yfinance parsing and adds adjustable summary font sizes. "
+    "If some symbols are unavailable in your region, those series will be skipped automatically."
+)
